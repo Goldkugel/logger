@@ -1,0 +1,6 @@
+logger:
+  folder: "./data/logs/"
+  name: "output.log"
+  headerChar: "="
+  headerLen: 60
+  timeFormat: "%Y-%m-%d %H:%M:%S"
