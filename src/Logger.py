@@ -3,22 +3,29 @@ from LoggerModel        import LoggingConfig
 import pandas                           as pd
 import yaml
 import os
+import time
+
+configuration_section: str = "logger"
+standard_directory: str = "../config/config.yaml"
 
 class Logger:
 
     config : LoggingConfig = None
+    start_time = 0
     _instance = None
+    
 
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
+            cls.start_time = time.time()
         return cls._instance
 
-    def __init__(self, config: str = "../config/config.yaml"):
+    def __init__(self, config: str = standard_directory):
         with open(config, "r") as f:
             data = yaml.safe_load(f)
 
-        self.config = LoggingConfig(**data)
+        self.config = LoggingConfig.model_validate(data[configuration_section])
         
 
     def log(self, string: str = "", cmdline: bool = True) -> None:
@@ -30,10 +37,12 @@ class Logger:
             log_file = open(file = str(path), mode = "a")
 
             # Prefix log message with timestamp
-            message = (
-                "[" + dt.now().strftime(self.config.format) + "] "
-                + string
-            )
+            message = "[" + dt.now().strftime(self.config.format) + "] "
+
+            if self.config.log_runtime:
+                minutes = str(int((time.time() - self.start_time) // 60))
+                message = message + "(" + minutes + " Minutes) "
+            message = message + string
 
             if cmdline:
                 print(message)

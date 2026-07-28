@@ -1,6 +1,8 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 class LoggingConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     folder: str = "../data/logs/"
     file_name: str = "output.log"
     header_char: str = "="

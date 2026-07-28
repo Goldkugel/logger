@@ -6,3 +6,4 @@ from Logger import Logger
 
 l = Logger()
 l.log("This is a Test.")
+l.printHeader("Test")
