@@ -7,14 +7,13 @@ import time
 import sys
 
 # Prevent Python from generating .pyc files (compiled bytecode files)
-sys.dont_write_bytecode = True
+sys.dont_write_bytecode     = True
 
 # Key under which logger settings are expected to live in the YAML config file.
-configuration_section: str = "logger"
+configuration_section: str  = "logger"
 
 # Default path to the config file, used if no path is explicitly passed in.
-standard_directory: str = "../config/config.yaml"
-
+standard_directory: str     = "../config/config.yaml"
 
 class Logger:
     """
@@ -96,7 +95,8 @@ class Logger:
 
             # Write the message to the log file, followed by a newline.
             # Note: the file handle is not explicitly closed here.
-            log_file.write(message + "\n")
+            with open(file = str(path), mode = "a") as log_file:
+                log_file.write(message + "\n")
 
     def printHeader(self, text: str = "") -> int:
         """
