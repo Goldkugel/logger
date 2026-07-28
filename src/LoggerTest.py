@@ -4,6 +4,6 @@ sys.dont_write_bytecode = True
 
 from Logger import Logger 
 
-l = Logger()
+l = Logger("../config/config.yaml")
 l.log("This is a Test.")
 l.printHeader("Test")
