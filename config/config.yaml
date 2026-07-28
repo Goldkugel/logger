@@ -1,6 +1,7 @@
 logger:
-  folder: "./data/logs/"
-  name: "output.log"
-  headerChar: "="
-  headerLen: 60
-  timeFormat: "%Y-%m-%d %H:%M:%S"
+  folder: "../data/logs/"
+  file_name: "output.log"
+  header_char: "="
+  header_lenght: 60
+  log_runtime: True
+  format: "%Y-%m-%d %H:%M:%S"
