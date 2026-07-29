@@ -1,13 +1,14 @@
+import sys
+
+# Prevent Python from generating .pyc files (compiled bytecode files)
+sys.dont_write_bytecode     = True
+
 from datetime           import datetime         as dt
 from LoggerModel        import LoggingConfig
 import pandas                                   as pd
 import yaml
 import os
 import time
-import sys
-
-# Prevent Python from generating .pyc files (compiled bytecode files)
-sys.dont_write_bytecode     = True
 
 # Key under which logger settings are expected to live in the YAML config file.
 configuration_section: str  = "logger"
@@ -125,7 +126,7 @@ class Logger:
         Log the start of file processing.
         """
         # Use only the file's base name (strip directory path) in the message.
-        message = "Processing file '" + os.path.basename(file) + "'."
+        message = "Processing file '" + os.path.basename(file) + "'..."
         self.log(message)
         return len(message)
 
@@ -156,7 +157,7 @@ class Logger:
         """
         Log file read start.
         """
-        message = "Reading file '" + os.path.basename(file) + "'."
+        message = "Reading file '" + os.path.basename(file) + "'..."
         self.log(message)
         return len(message)
 
@@ -164,7 +165,7 @@ class Logger:
         """
         Log file write start.
         """
-        message = "Writing file '" + os.path.basename(file) + "'."
+        message = "Writing file '" + os.path.basename(file) + "'..."
         self.log(message)
         return len(message)
 
