@@ -4,7 +4,7 @@ import sys
 sys.dont_write_bytecode     = True
 
 from datetime           import datetime         as dt
-from LoggerModel        import LoggingConfig
+from LoggerConfig       import LoggerConfig
 import pandas                                   as pd
 import yaml
 import os
@@ -29,7 +29,7 @@ class Logger:
 
     # Validated configuration object (folder, file name, header settings, etc.)
     # Class-level attribute: shared by all "instances" since this is a singleton.
-    config: LoggingConfig = None
+    config: LoggerConfig = None
 
     # Timestamp (seconds since epoch) recorded when the singleton is first created.
     # Used later to compute elapsed runtime for log messages.
@@ -58,6 +58,8 @@ class Logger:
         __new__ returns the same singleton instance - so re-instantiating
         with a different path will reload/overwrite the shared config.
         """
+        data = None
+        
         # Open and parse the YAML config file.
         with open(config, "r") as f:
             data = yaml.safe_load(f)
@@ -65,7 +67,7 @@ class Logger:
         # Extract the "logger" section and validate/coerce it into a
         # LoggingConfig model (raises if required fields are missing/invalid,
         # or if unexpected keys are present, per the model's config).
-        self.config = LoggingConfig.model_validate(data[configuration_section])
+        self.config = LoggerConfig.model_validate(data[configuration_section])
 
     def log(self, string: str = "", cmdline: bool = True) -> None:
         """
@@ -75,8 +77,6 @@ class Logger:
         if string is not None:
             # Build the full path to the log file from the config.
             path = os.path.join(self.config.folder, self.config.file_name)
-            # Open in append mode so previous log entries are preserved.
-            log_file = open(file=str(path), mode="a")
 
             # Prefix log message with timestamp, formatted per config.
             message = "[" + dt.now().strftime(self.config.format) + "] "

@@ -4,7 +4,7 @@ import sys
 # Prevent Python from generating .pyc files (compiled bytecode files)
 sys.dont_write_bytecode = True
 
-class LoggingConfig(BaseModel):
+class LoggerConfig(BaseModel):
     """
     Pydantic model defining and validating the configuration schema for the
     Logger class.
