@@ -316,7 +316,7 @@ class TestFileProcessingHelpers:
 
         lines = read_log_lines(log_folder)
         assert "Processing file 'input_data.csv'." in lines[0]
-        assert ret == len("Processing file 'input_data.csv'.")
+        assert ret == len("Processing file 'input_data.csv'...")
 
     def test_print_file_processing_end(self, logger_instance):
         logger, log_folder = logger_instance
