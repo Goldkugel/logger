@@ -3,8 +3,8 @@ import sys
 # Prevent Python from generating .pyc files (compiled bytecode files)
 sys.dont_write_bytecode     = True
 
-from datetime           import datetime         as dt
-from LoggerConfig       import LoggerConfig
+from datetime            import datetime         as dt
+from .LoggerConfig       import LoggerConfig
 import pandas                                   as pd
 import yaml
 import os
