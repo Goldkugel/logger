@@ -22,7 +22,7 @@ class LoggerConfig(BaseModel):
     model_config        = ConfigDict(extra = "forbid")
 
     # Directory where the log file will be written (relative or absolute path).
-    folder: str         = "../data/logs/"
+    folder: str         = "./data/logs/"
 
     # Name of the log file to write to within `folder`.
     file_name: str      = "output.log"
