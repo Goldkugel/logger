@@ -8,8 +8,7 @@ version = "1.0.6"
 dependencies = []
 
 [tool.setuptools]
-package-dir = {"logger" = "src"}
+packages = ["logger"]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["logger"]
+[tool.setuptools.package-dir]
+"logger" = "src"
