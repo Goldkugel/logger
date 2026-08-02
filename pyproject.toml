@@ -1,4 +1,10 @@
 [project]
 name = "logger"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = []
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
