@@ -1,32 +1,33 @@
 """
-Test suite for the Logger class.
+Test suite for the Logger class and LoggerConfig model.
+
+Tests cover:
+- Singleton behaviour (__new__, start_time, shared config)
+- Configuration loading (valid YAML, missing file, missing section)
+- log() — file writing, timestamps, runtime, stdout, None handling
+- printHeader() — line count, border characters, return value
+- File-processing helper methods (printFileProcessingStart/End, etc.)
+- printDataFrameRowCount() — row count logging, None handling
 
 Run with:
-    pytest test_logger.py -v
+    pytest src/LoggerTest.py -v
 
-Requires:
-    pytest
-    pyyaml
-    pandas
-    (a LoggerModel module defining LoggingConfig, importable from PYTHONPATH)
-
-Uses ./config/config.yaml (relative to the current working directory at
-test-run time) as the default logger configuration for most tests - so
-this file must be run from a location where that relative path resolves
-to the project's real config file (e.g. from the repository root, or
-wherever config/config.yaml actually sits relative to the invocation).
+The real ./config/config.yaml is used as the default configuration for most
+tests. Run pytest from the repository root so that relative paths resolve
+correctly.
 """
-import sys
 
-# Prevent Python from generating .pyc files (compiled bytecode files)
-sys.dont_write_bytecode = True
+from __future__ import annotations
 
-from logger import Logger
 import os
 import time
-import yaml
+
+import pandas   as pd
 import pytest
-import pandas as pd
+import yaml
+
+from logger import Logger
+
 
 # --------------------------------------------------------------------------
 # Fixtures
@@ -35,56 +36,82 @@ import pandas as pd
 @pytest.fixture(autouse=True)
 def reset_singleton():
     """
-    Logger is a singleton (`_instance` is a class attribute), so state leaks
-    between tests unless we reset it before and after every test.
+    Reset the Logger singleton before and after every test.
+
+    Logger stores its instance, config, and start_time as class-level
+    attributes, so without this reset, state leaks between tests and the
+    order in which tests run would affect their outcome.
     """
-    Logger._instance = None
-    Logger.config = None
+    Logger._instance  = None
+    Logger.config     = None
     Logger.start_time = 0
     yield
-    Logger._instance = None
-    Logger.config = None
+    Logger._instance  = None
+    Logger.config     = None
     Logger.start_time = 0
+
 
 @pytest.fixture
 def config_file():
     """
-    Points tests at the project's real logger configuration file,
-    ./config/config.yaml, instead of a synthetic temp one built per
-    test. The folder/file name used for log assertions are read
-    directly from that file's "logger" section, so this fixture stays
-    correct even if those values change.
+    Point tests at the project's real logger configuration file
+    (./config/config.yaml).
 
-    Since this reuses a persistent, shared file rather than a fresh
-    tmp_path per test, the target log file is removed before the test
-    runs (and again afterward) so tests that assert exact line counts
-    still get a clean slate, the same guarantee a fresh temp directory
-    used to provide.
+    The log file named in that config is removed before and after each
+    test so that tests asserting on exact line counts always start with
+    a clean slate — the same guarantee a fresh tmp_path would give.
+
+    Yields
+    ------
+    tuple[str, str]
+        (config_path, log_folder) — the path to the YAML config file and
+        the log output directory read from it.
     """
     config_path = "./config/config.yaml"
     with open(config_path, "r") as f:
         config_data = yaml.safe_load(f)
+
     logger_section = config_data["logger"]
-    log_folder = logger_section["folder"]
-    file_name = logger_section["file_name"]
+    log_folder     = logger_section["folder"]
+    file_name      = logger_section["file_name"]
 
     os.makedirs(log_folder, exist_ok=True)
     log_path = os.path.join(log_folder, file_name)
+
+    # Remove any leftover log file from a previous run before the test starts.
     if os.path.exists(log_path):
         os.remove(log_path)
 
     yield config_path, log_folder
 
+    # Clean up after the test as well so the log directory stays tidy.
     if os.path.exists(log_path):
         os.remove(log_path)
 
+
 @pytest.fixture
 def logger_instance(config_file):
+    """
+    Build a Logger using the real config file and return it together with
+    the log folder path (needed by helper read_log_lines).
+
+    Yields
+    ------
+    tuple[Logger, str]
+        (logger, log_folder)
+    """
     config_path, log_folder = config_file
     logger = Logger(config=config_path)
     return logger, log_folder
 
-def read_log_lines(log_folder, file_name="output.log"):
+
+def read_log_lines(log_folder: str, file_name: str = "output.log") -> list[str]:
+    """
+    Read all lines from the log file and return them as a list.
+
+    Returns an empty list if the file does not yet exist, which lets
+    tests that assert on an empty log avoid a FileNotFoundError.
+    """
     path = os.path.join(log_folder, file_name)
     if not os.path.exists(path):
         return []
@@ -93,10 +120,17 @@ def read_log_lines(log_folder, file_name="output.log"):
 
 
 # --------------------------------------------------------------------------
-# Singleton behavior
+# Singleton behaviour
 # --------------------------------------------------------------------------
 
 class TestSingleton:
+    """
+    Tests for the singleton pattern implemented in Logger.__new__.
+
+    Verifies that only one instance is ever created, that start_time is
+    recorded exactly once, and that config is shared (and overwritten)
+    across all references to the singleton.
+    """
 
     def test_returns_same_instance(self, config_file):
         config_path, _ = config_file
@@ -110,40 +144,42 @@ class TestSingleton:
         first_start_time = Logger.start_time
         time.sleep(0.05)
         logger2 = Logger(config=config_path)
+        # start_time must not be updated on the second call.
         assert Logger.start_time == first_start_time
         assert logger1 is logger2
 
     def test_config_shared_across_instances(self, config_file, tmp_path):
         """
-        Because `config` is a class attribute, the second Logger(...) call
-        does NOT create a new config for a new instance - it overwrites the
-        shared one. This test documents that behavior.
+        Because `config` is a class attribute, calling Logger() a second
+        time with a different config path overwrites the shared config.
+        This test documents that behaviour explicitly so it is not
+        accidentally "fixed" in a way that breaks callers relying on it.
         """
         config_path, _ = config_file
         logger1 = Logger(config=config_path)
 
-        # Build a second, different config file - a disposable temp file,
-        # not the real project config, since this test needs content that
-        # deliberately differs from it.
+        # Build a second, deliberately different config in a temp directory
+        # so this test does not depend on or modify the real config file.
         other_folder = tmp_path / "other_logs"
         other_folder.mkdir()
         other_config_path = tmp_path / "other_config.yaml"
         with open(other_config_path, "w") as f:
             yaml.safe_dump({
                 "logger": {
-                    "folder": str(other_folder) + os.sep,
-                    "file_name": "other.log",
-                    "header_char": "=",
+                    "folder"       : str(other_folder) + os.sep,
+                    "file_name"    : "other.log",
+                    "header_char"  : "=",
                     "header_length": 10,
-                    "log_runtime": False,
-                    "format": "%H:%M:%S",
+                    "log_runtime"  : False,
+                    "format"       : "%H:%M:%S",
                 }
             }, f)
 
         logger2 = Logger(config=str(other_config_path))
 
+        # Still the same instance — but the shared config now reflects the
+        # second call's settings.
         assert logger1 is logger2
-        # Shared config now reflects the second call's config
         assert logger1.config.file_name == "other.log"
 
 
@@ -152,19 +188,27 @@ class TestSingleton:
 # --------------------------------------------------------------------------
 
 class TestConfigLoading:
+    """
+    Tests for Logger.__init__ and the YAML → LoggerConfig loading path.
+
+    Verifies that valid config files are parsed correctly, and that
+    invalid or missing files raise the expected exceptions.
+    """
 
     def test_loads_expected_fields(self, logger_instance):
+        """
+        Config fields loaded from YAML must match what the file actually
+        contains — checked dynamically so this test stays correct even if
+        the config file is updated.
+        """
         logger, _ = logger_instance
-        # Compare against the same real config file's own content, rather
-        # than hardcoded expected values, since this now reads whatever
-        # ./config/config.yaml actually contains.
         with open("./config/config.yaml", "r") as f:
             expected = yaml.safe_load(f)["logger"]
-        assert logger.config.file_name == expected["file_name"]
-        assert logger.config.header_char == expected["header_char"]
+        assert logger.config.file_name     == expected["file_name"]
+        assert logger.config.header_char   == expected["header_char"]
         assert logger.config.header_length == expected["header_length"]
-        assert logger.config.log_runtime == expected["log_runtime"]
-        assert logger.config.format == expected["format"]
+        assert logger.config.log_runtime   == expected["log_runtime"]
+        assert logger.config.format        == expected["format"]
 
     def test_missing_config_file_raises(self, tmp_path):
         missing_path = str(tmp_path / "does_not_exist.yaml")
@@ -172,6 +216,10 @@ class TestConfigLoading:
             Logger(config=missing_path)
 
     def test_missing_logger_section_raises(self, tmp_path):
+        """
+        A YAML file that has no "logger" key should raise a KeyError when
+        Logger tries to extract data[configuration_section].
+        """
         bad_config_path = tmp_path / "bad_config.yaml"
         with open(bad_config_path, "w") as f:
             yaml.safe_dump({"not_logger": {}}, f)
@@ -184,6 +232,10 @@ class TestConfigLoading:
 # --------------------------------------------------------------------------
 
 class TestLog:
+    """
+    Tests for Logger.log() — file writing, timestamp format, runtime
+    prefix, stdout output, and edge cases (None, empty string).
+    """
 
     def test_log_writes_to_file(self, logger_instance):
         logger, log_folder = logger_instance
@@ -196,6 +248,7 @@ class TestLog:
         logger, log_folder = logger_instance
         logger.log("Timestamped message", cmdline=False)
         lines = read_log_lines(log_folder)
+        # Timestamps are wrapped in square brackets: "[YYYY-MM-DD HH:MM:SS]"
         assert lines[0].startswith("[")
         assert "]" in lines[0]
 
@@ -208,21 +261,22 @@ class TestLog:
         assert "Minutes" in lines[0]
 
     def test_log_excludes_runtime_when_disabled(self, config_file, tmp_path):
+        """
+        Build a disposable config with log_runtime=False and verify that
+        the "Minutes" token is absent from the log line.
+        """
         _, log_folder = config_file
-        # Build a separate, disposable temp config with log_runtime
-        # disabled, pointing at the same log folder the real config
-        # uses - rather than overwriting the real ./config/config.yaml.
         disabled_config_path = tmp_path / "disabled_config.yaml"
         folder_value = log_folder if log_folder.endswith(os.sep) else log_folder + os.sep
         with open(disabled_config_path, "w") as f:
             yaml.safe_dump({
                 "logger": {
-                    "folder": folder_value,
-                    "file_name": "output.log",
-                    "header_char": "-",
+                    "folder"       : folder_value,
+                    "file_name"    : "output.log",
+                    "header_char"  : "-",
                     "header_length": 20,
-                    "log_runtime": False,
-                    "format": "%Y-%m-%d %H:%M:%S",
+                    "log_runtime"  : False,
+                    "format"       : "%Y-%m-%d %H:%M:%S",
                 }
             }, f)
         logger = Logger(config=str(disabled_config_path))
@@ -232,12 +286,17 @@ class TestLog:
         assert "No runtime" in lines[0]
 
     def test_log_none_string_does_nothing(self, logger_instance):
+        """None is silently ignored — no line should be written."""
         logger, log_folder = logger_instance
         logger.log(None, cmdline=False)
         lines = read_log_lines(log_folder)
         assert lines == []
 
     def test_log_empty_string_still_writes_timestamp(self, logger_instance):
+        """
+        An empty string produces a timestamp-only line, useful for adding
+        blank separators to the log without a visible message body.
+        """
         logger, log_folder = logger_instance
         logger.log("", cmdline=False)
         lines = read_log_lines(log_folder)
@@ -257,12 +316,13 @@ class TestLog:
         assert captured.out == ""
 
     def test_multiple_log_calls_append(self, logger_instance):
+        """Each log() call appends a new line; previous lines are not overwritten."""
         logger, log_folder = logger_instance
         logger.log("First", cmdline=False)
         logger.log("Second", cmdline=False)
         lines = read_log_lines(log_folder)
         assert len(lines) == 2
-        assert "First" in lines[0]
+        assert "First"  in lines[0]
         assert "Second" in lines[1]
 
 
@@ -271,6 +331,10 @@ class TestLog:
 # --------------------------------------------------------------------------
 
 class TestPrintHeader:
+    """
+    Tests for Logger.printHeader() — line count, border characters,
+    centered body text, and the integer length returned.
+    """
 
     def test_writes_three_lines(self, logger_instance):
         logger, log_folder = logger_instance
@@ -282,9 +346,9 @@ class TestPrintHeader:
         logger, log_folder = logger_instance
         logger.printHeader("Section")
         lines = read_log_lines(log_folder)
-        header_char = logger.config.header_char
+        header_char   = logger.config.header_char
         header_length = logger.config.header_length
-        # First and last lines are the head/foot border
+        # First and last lines are the top/bottom border.
         assert header_char * header_length in lines[0]
         assert header_char * header_length in lines[2]
 
@@ -295,13 +359,17 @@ class TestPrintHeader:
         assert "Title" in lines[1]
 
     def test_returns_expected_length(self, logger_instance):
+        """
+        The return value should equal the combined character length of all
+        three logged lines (excluding timestamps and newlines).
+        """
         logger, _ = logger_instance
         header_length = logger.config.header_length
-        header_char = logger.config.header_char
-        head_foot = header_char * header_length
-        body = header_char + "Body".center(header_length - 2) + header_char
-        expected = 2 * len(head_foot) + len(body)
-        result = logger.printHeader("Body")
+        header_char   = logger.config.header_char
+        head_foot     = header_char * header_length
+        body          = header_char + "Body".center(header_length - 2) + header_char
+        expected      = 2 * len(head_foot) + len(body)
+        result        = logger.printHeader("Body")
         assert result == expected
 
 
@@ -310,6 +378,14 @@ class TestPrintHeader:
 # --------------------------------------------------------------------------
 
 class TestFileProcessingHelpers:
+    """
+    Tests for the file-processing helper methods:
+    printFileProcessingStart/End, printReadFileStart/End,
+    printWriteFileStart/End.
+
+    Verifies that only the basename of the path is logged (not the full
+    directory), and that the return value equals the message length.
+    """
 
     def test_print_file_processing_start(self, logger_instance):
         logger, log_folder = logger_instance
@@ -349,6 +425,7 @@ class TestFileProcessingHelpers:
         assert "Writing file 'data.csv' completed." in lines[0]
 
     def test_basename_extracted_from_full_path(self, logger_instance):
+        """Directory components of the path must not appear in the log message."""
         logger, log_folder = logger_instance
         logger.printFileProcessingStart("/some/nested/dir/report.xlsx")
         lines = read_log_lines(log_folder)
@@ -361,10 +438,14 @@ class TestFileProcessingHelpers:
 # --------------------------------------------------------------------------
 
 class TestPrintDataFrameRowCount:
+    """
+    Tests for Logger.printDataFrameRowCount() — logs the row count of a
+    DataFrame, or does nothing when None is passed.
+    """
 
     def test_logs_row_count_for_non_empty_dataframe(self, logger_instance):
         logger, log_folder = logger_instance
-        df = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+        df  = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
         ret = logger.printDataFrameRowCount(df)
         lines = read_log_lines(log_folder)
         assert "Row count: 3" in lines[0]
@@ -378,6 +459,7 @@ class TestPrintDataFrameRowCount:
         assert "Row count: 0" in lines[0]
 
     def test_none_dataframe_does_not_log(self, logger_instance):
+        """None is silently ignored; no line is written and 0 is returned."""
         logger, log_folder = logger_instance
         ret = logger.printDataFrameRowCount(None)
         lines = read_log_lines(log_folder)
@@ -390,4 +472,5 @@ class TestPrintDataFrameRowCount:
 # --------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import sys
     sys.exit(pytest.main([__file__, "-v"]))

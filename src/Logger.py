@@ -1,52 +1,73 @@
-import sys
+"""
+Singleton logging utility for the adapter framework.
 
-# Prevent Python from generating .pyc files (compiled bytecode files)
-sys.dont_write_bytecode     = True
+Provides the Logger class, which reads its configuration from a YAML file,
+writes timestamped log messages to a file, and optionally mirrors them to
+stdout. A singleton pattern ensures that only one Logger instance (and one
+loaded config) exists per process, and that the runtime clock starts at the
+moment the very first Logger() call is made.
+"""
 
-from datetime            import datetime         as dt
-from .LoggerConfig       import LoggerConfig
-import pandas                                   as pd
+from __future__ import annotations
+
+from datetime       import datetime as dt
+from .LoggerConfig  import LoggerConfig
+import pandas       as pd
 import yaml
 import os
 import time
 
 # Key under which logger settings are expected to live in the YAML config file.
-configuration_section: str  = "logger"
+configuration_section: str = "logger"
 
 # Default path to the config file, used if no path is explicitly passed in.
-standard_directory: str     = "./config/config.yaml"
+standard_directory: str    = "./config/config.yaml"
+
 
 class Logger:
     """
     Singleton logging utility.
 
-    Reads its configuration from a YAML file (validated via LoggingConfig)
+    Reads its configuration from a YAML file (validated via LoggerConfig)
     and writes timestamped log messages to a file, optionally mirroring
     them to stdout. Because it's a singleton, only one instance (and one
     loaded config) exists per process, and `start_time` is fixed at the
     moment the first instance is created.
+
+    Class-level attributes
+    ----------------------
+    config : LoggerConfig or None
+        The validated configuration object shared by all callers. Set on
+        first instantiation and overwritten if Logger() is called again
+        with a different config path.
+    start_time : float
+        Seconds since epoch recorded when the singleton is first created.
+        Used to compute elapsed runtime in log messages.
+    _instance : Logger or None
+        The single shared instance, managed by __new__.
     """
 
-    # Validated configuration object (folder, file name, header settings, etc.)
-    # Class-level attribute: shared by all "instances" since this is a singleton.
-    config: LoggerConfig = None
-
-    # Timestamp (seconds since epoch) recorded when the singleton is first created.
-    # Used later to compute elapsed runtime for log messages.
-    start_time = 0
-
-    # Holds the single shared instance of this class.
-    _instance = None
+    # Class-level attributes are intentional here: because Logger is a
+    # singleton, config and start_time must be shared across all references
+    # to the same instance. They are set once in __new__ / __init__ and
+    # never duplicated per-instance.
+    config    : LoggerConfig = None
+    start_time: float        = 0.0
+    _instance : Logger       = None
 
     def __new__(cls, *args, **kwargs):
         """
         Ensure only one instance of Logger is ever created (singleton pattern).
-        Records the creation time on first instantiation only.
+
+        Records the creation time on first instantiation only. On all
+        subsequent calls, the existing instance is returned unchanged so
+        that start_time is never reset mid-run.
         """
         if cls._instance is None:
             # No instance exists yet: create it and start the runtime clock.
-            cls._instance = super().__new__(cls)
+            cls._instance  = super().__new__(cls)
             cls.start_time = time.time()
+
         # On subsequent calls, return the existing instance instead of a new one.
         return cls._instance
 
@@ -55,99 +76,174 @@ class Logger:
         Load and validate logger configuration from a YAML file.
 
         Note: __init__ runs every time Logger(...) is called, even though
-        __new__ returns the same singleton instance - so re-instantiating
-        with a different path will reload/overwrite the shared config.
+        __new__ returns the same singleton instance. Re-instantiating with
+        a different path will therefore reload and overwrite the shared
+        config — intentional, to allow reconfiguration without restarting
+        the process.
+
+        Parameters
+        ----------
+        config : str, optional
+            Path to the YAML configuration file. Defaults to
+            ./config/config.yaml relative to the working directory.
         """
-        data = None
-        
         # Open and parse the YAML config file.
         with open(config, "r") as f:
             data = yaml.safe_load(f)
 
         # Extract the "logger" section and validate/coerce it into a
-        # LoggingConfig model (raises if required fields are missing/invalid,
-        # or if unexpected keys are present, per the model's config).
+        # LoggerConfig model. Raises ValidationError if required fields are
+        # missing or invalid, or if unexpected keys are present (per the
+        # model's ConfigDict(extra="forbid") setting).
         self.config = LoggerConfig.model_validate(data[configuration_section])
 
     def log(self, string: str = "", cmdline: bool = True) -> None:
         """
         Log a timestamped message to file and optionally to stdout.
+
+        If `string` is None, the call is silently ignored — this allows
+        callers to pass through optional values without extra None checks.
+        An empty string is logged as a timestamp-only line, which is useful
+        for adding blank separators to the log without a visible message.
+
+        Parameters
+        ----------
+        string : str, optional
+            The message to log. None is silently ignored.
+        cmdline : bool, optional
+            Whether to also print the message to stdout (default True).
         """
-        # Skip logging entirely if no message was given.
-        if string is not None:
-            # Build the full path to the log file from the config.
-            path = os.path.join(self.config.folder, self.config.file_name)
+        # Silently ignore None — allows callers to pass optional values
+        # without wrapping every call in a None check.
+        if string is None:
+            return
 
-            # Prefix log message with timestamp, formatted per config.
-            message = "[" + dt.now().strftime(self.config.format) + "] "
+        # Build the full path to the log file from the config.
+        path = os.path.join(self.config.folder, self.config.file_name)
 
-            # Optionally prepend elapsed runtime (in whole minutes) since
-            # the Logger singleton was first created.
-            if self.config.log_runtime:
-                minutes = str(int((time.time() - self.start_time) // 60))
-                message = message + "(" + minutes + " Minutes) "
+        # Start the log line with a timestamp, formatted per config.
+        message = f"[{dt.now().strftime(self.config.format)}] "
 
-            # Append the actual log content after the timestamp/runtime prefix.
-            message = message + string
+        # Optionally prepend elapsed runtime (in whole minutes) since the
+        # Logger singleton was first created. Useful for tracking pipeline
+        # step durations without external profiling tools.
+        if self.config.log_runtime:
+            minutes = int((time.time() - self.start_time) // 60)
+            message = f"{message}({minutes} Minutes) "
 
-            # Mirror the message to the console if requested.
-            if cmdline:
-                print(message)
+        # Append the actual log content after the timestamp/runtime prefix.
+        message = f"{message}{string}"
 
-            # Write the message to the log file, followed by a newline.
-            # Note: the file handle is not explicitly closed here.
-            with open(file = str(path), mode = "a") as log_file:
-                log_file.write(message + "\n")
+        # Mirror the message to the console if requested.
+        if cmdline:
+            print(message)
+
+        # Append the message to the log file. Opening in "a" (append) mode
+        # ensures that previous log entries are never overwritten.
+        with open(str(path), mode="a") as log_file:
+            log_file.write(message + "\n")
 
     def printHeader(self, text: str = "") -> int:
         """
-        Print a formatted header block to the log/console.
+        Print a formatted header block to the log and console.
+
+        The header consists of three lines:
+          1. A top border of `header_char` repeated `header_length` times.
+          2. A body line: `header_char`, the given text centered within
+             `header_length - 2` characters, then another `header_char`.
+          3. A bottom border identical to the top border.
+
+        Parameters
+        ----------
+        text : str, optional
+            Text to display in the center of the header body.
+
+        Returns
+        -------
+        int
+            Combined character length of all three lines logged (excluding
+            timestamps and newlines).
         """
-        # Build the top/bottom border line by repeating header_char.
+        # Build the top/bottom border by repeating the header character.
         head_foot = self.config.header_char * self.config.header_length
 
-        # Build the middle line: header_char, then the given text centered
-        # within (header_length - 2) characters, then another header_char,
-        # so the body line matches the border's overall width.
-        body = self.config.header_char + \
-               text.center(self.config.header_length - 2) + \
-               self.config.header_char
+        # Build the body line: header character on each side, text centered
+        # within the remaining width so the body matches the border's total width.
+        body = (
+            f"{self.config.header_char}"
+            f"{text.center(self.config.header_length - 2)}"
+            f"{self.config.header_char}"
+        )
 
         # Log the three lines in order: top border, body, bottom border.
         self.log(head_foot)
         self.log(body)
         self.log(head_foot)
 
-        # Return the combined character length of all three lines logged.
+        # Return the combined character length of all three lines logged,
+        # which callers can use for layout alignment or progress reporting.
         return 2 * len(head_foot) + len(body)
 
     def printFileProcessingStart(self, file: str = "") -> int:
         """
-        Log the start of file processing.
+        Log the start of processing for a file.
+
+        Only the basename of `file` is logged — the directory path is
+        stripped to keep messages concise.
+
+        Parameters
+        ----------
+        file : str, optional
+            Full or relative path to the file being processed.
+
+        Returns
+        -------
+        int
+            Length of the logged message string.
         """
-        # Use only the file's base name (strip directory path) in the message.
-        message = "Processing file '" + os.path.basename(file) + "'..."
+        message = f"Processing file '{os.path.basename(file)}'..."
         self.log(message)
         return len(message)
 
     def printFileProcessingEnd(self, file: str = "") -> int:
         """
-        Log completion of file processing.
+        Log the completion of processing for a file.
+
+        Parameters
+        ----------
+        file : str, optional
+            Full or relative path to the file that was processed.
+
+        Returns
+        -------
+        int
+            Length of the logged message string.
         """
-        message = "Processing file '" + os.path.basename(file) + "' completed."
+        message = f"Processing file '{os.path.basename(file)}' completed."
         self.log(message)
         return len(message)
 
     def printDataFrameRowCount(self, data: pd.DataFrame = None) -> int:
         """
         Log the number of rows in a DataFrame.
+
+        If `data` is None, nothing is logged and 0 is returned.
+
+        Parameters
+        ----------
+        data : pd.DataFrame or None, optional
+            The DataFrame whose row count to log.
+
+        Returns
+        -------
+        int
+            Length of the logged message string, or 0 if no DataFrame
+            was provided.
         """
-        # Default return value if no DataFrame is provided.
         ret = 0
 
-        # Only attempt to log a row count if a DataFrame was actually passed.
         if data is not None:
-            message = "Row count: " + str(len(data.index))
+            message = f"Row count: {len(data)}"
             self.log(message)
             ret = len(message)
 
@@ -155,32 +251,72 @@ class Logger:
 
     def printReadFileStart(self, file: str = "") -> int:
         """
-        Log file read start.
+        Log the start of reading a file.
+
+        Parameters
+        ----------
+        file : str, optional
+            Full or relative path to the file being read.
+
+        Returns
+        -------
+        int
+            Length of the logged message string.
         """
-        message = "Reading file '" + os.path.basename(file) + "'..."
+        message = f"Reading file '{os.path.basename(file)}'..."
         self.log(message)
         return len(message)
 
     def printWriteFileStart(self, file: str = "") -> int:
         """
-        Log file write start.
+        Log the start of writing a file.
+
+        Parameters
+        ----------
+        file : str, optional
+            Full or relative path to the file being written.
+
+        Returns
+        -------
+        int
+            Length of the logged message string.
         """
-        message = "Writing file '" + os.path.basename(file) + "'..."
+        message = f"Writing file '{os.path.basename(file)}'..."
         self.log(message)
         return len(message)
 
     def printReadFileEnd(self, file: str = "") -> int:
         """
-        Log file read completion.
+        Log the completion of reading a file.
+
+        Parameters
+        ----------
+        file : str, optional
+            Full or relative path to the file that was read.
+
+        Returns
+        -------
+        int
+            Length of the logged message string.
         """
-        message = "Reading file '" + os.path.basename(file) + "' completed."
+        message = f"Reading file '{os.path.basename(file)}' completed."
         self.log(message)
         return len(message)
 
     def printWriteFileEnd(self, file: str = "") -> int:
         """
-        Log file write completion.
+        Log the completion of writing a file.
+
+        Parameters
+        ----------
+        file : str, optional
+            Full or relative path to the file that was written.
+
+        Returns
+        -------
+        int
+            Length of the logged message string.
         """
-        message = "Writing file '" + os.path.basename(file) + "' completed."
+        message = f"Writing file '{os.path.basename(file)}' completed."
         self.log(message)
         return len(message)
