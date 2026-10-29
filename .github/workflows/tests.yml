@@ -14,11 +14,16 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned instead of ubuntu-latest: actions/setup-python only provides
+    # Python builds per Ubuntu release, and Ubuntu 26.04 has none older than
+    # 3.10. Ubuntu 24.04 still provides 3.8, the minimum in pyproject.toml.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.12", "3.14"]
+        # Oldest supported (requires-python), the version used by the
+        # pipeline (3.11) and the newest version.
+        python-version: ["3.8", "3.11", "3.14"]
 
     steps:
       - uses: actions/checkout@v4

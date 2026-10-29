@@ -112,7 +112,7 @@ pytest tests/LoggerTest.py -v
 
 The tests use `./config/config.yaml` and remove the log file configured there before and after each test. The `test` extra installs `pytest` and `pandas` (used to build test DataFrames).
 
-The tests also run automatically on GitHub Actions for every push and pull request (Python 3.9, 3.12 and 3.14); see [`.github/workflows/tests.yml`](./.github/workflows/tests.yml).
+The tests also run automatically on GitHub Actions for every push and pull request (Python 3.8, 3.11 and 3.14 on Ubuntu 24.04); see [`.github/workflows/tests.yml`](./.github/workflows/tests.yml).
 
 ## License
 
