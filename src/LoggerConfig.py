@@ -8,7 +8,37 @@ from the package so that callers can validate a configuration themselves.
 
 import codecs
 
+from typing   import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+# Supported log levels, from lowest to highest severity. Logger.log() drops
+# messages whose level is below the configured minimum `level`.
+LogLevel  = Literal["info", "warning", "error"]
+
+# Colors available for console output. "none" prints without color.
+ColorName = Literal[
+    "none", "black", "red", "green", "yellow",
+    "blue", "magenta", "cyan", "white",
+]
+
+# Ways of displaying the elapsed runtime when `log_runtime` is enabled:
+# "minutes" as "(3 Minutes)", "hms" as "(00:03:12)".
+RuntimeFormat = Literal["minutes", "hms"]
+
+
+class LevelColors(BaseModel):
+    """
+    Console color per log level, set in the `colors` subsection of the
+    "logger" config section. Colors are only applied to console output,
+    never to the log file.
+    """
+
+    # Reject unknown levels, e.g. a typo such as "warn".
+    model_config = ConfigDict(extra="forbid")
+
+    info: ColorName    = "white"
+    warning: ColorName = "yellow"
+    error: ColorName   = "red"
 
 
 class LoggerConfig(BaseModel):
@@ -67,6 +97,19 @@ class LoggerConfig(BaseModel):
     # Text encoding used when writing the log file. Set explicitly so the
     # output does not depend on the system locale.
     encoding: str       = "utf-8"
+
+    # Minimum level a message must have to be logged: "info" logs
+    # everything, "warning" only warnings and errors, "error" only errors.
+    level: LogLevel     = "info"
+
+    # How the elapsed runtime is displayed when `log_runtime` is enabled:
+    # "minutes" -> "(3 Minutes)", "hms" -> "(00:03:12)".
+    runtime_format: RuntimeFormat = "minutes"
+
+    # Console color per log level (see LevelColors). Colors are only used
+    # when stdout is a terminal and the NO_COLOR environment variable is not
+    # set, so redirected output and log files never contain color codes.
+    colors: LevelColors = Field(default_factory=LevelColors)
 
     @field_validator("encoding")
     @classmethod

@@ -1,4 +1,5 @@
-# Runs the Logger test suite on every push and pull request.
+# Runs the Logger test suite on every push and pull request and reports the
+# test coverage of the package.
 #
 # The package is installed from the checkout (not in editable mode), so the
 # run also checks that pyproject.toml declares all runtime dependencies.
@@ -41,5 +42,17 @@ jobs:
       - name: Check that the package imports without test dependencies
         run: python -I -c "import sys, logger; assert 'pandas' not in sys.modules"
 
-      - name: Run tests
-        run: python -m pytest tests/LoggerTest.py -v
+      # --cov=logger measures the installed package (the code under test),
+      # term-missing lists the uncovered line numbers in the job log.
+      - name: Run tests with coverage
+        run: python -m pytest tests/LoggerTest.py -v --cov=logger --cov-report=term-missing
+
+      # Also show the coverage table on the run's summary page. Runs even if
+      # tests failed, as long as coverage data (.coverage) was written.
+      - name: Add coverage to job summary
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f .coverage ]; then
+            echo "### Coverage (Python ${{ matrix.python-version }})" >> "$GITHUB_STEP_SUMMARY"
+            python -m coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+          fi

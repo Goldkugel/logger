@@ -6,3 +6,9 @@ logger:
   log_runtime: True
   format: "%Y-%m-%d %H:%M:%S"
   encoding: "utf-8"
+  level: "info"
+  runtime_format: "minutes"
+  colors:
+    info: "white"
+    warning: "yellow"
+    error: "red"

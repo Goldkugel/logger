@@ -9,6 +9,11 @@ Tests cover:
 - printHeader() — line count, border characters, return value, truncation
 - File-processing helper methods (printFileProcessingStart/End, etc.)
 - printDataFrameRowCount() — row count logging, None handling
+- Logger.reset() and passing the config as a dict or LoggerConfig
+- Log levels, minimum level, level helpers and console colors
+- Runtime display formats ("minutes", "hms")
+- exception() and step()
+- Thread safety
 
 Run with:
     pytest tests/LoggerTest.py -v
@@ -21,7 +26,11 @@ correctly.
 from __future__ import annotations
 
 import os
+import sys
+import threading
 import time
+
+from types import SimpleNamespace
 
 import pandas   as pd
 import pytest
@@ -29,7 +38,7 @@ import yaml
 
 from pydantic import ValidationError
 
-from logger import Logger
+from logger import LevelColors, Logger, LoggerConfig
 
 
 # --------------------------------------------------------------------------
@@ -45,13 +54,9 @@ def reset_singleton():
     attributes, so without this reset, state leaks between tests and the
     order in which tests run would affect their outcome.
     """
-    Logger._instance  = None
-    Logger.config     = None
-    Logger.start_time = 0
+    Logger.reset()
     yield
-    Logger._instance  = None
-    Logger.config     = None
-    Logger.start_time = 0
+    Logger.reset()
 
 
 @pytest.fixture
@@ -240,15 +245,22 @@ class TestConfigLoading:
         assert logger.config.log_runtime   == expected["log_runtime"]
         assert logger.config.format        == expected["format"]
         assert logger.config.encoding      == expected["encoding"]
+        assert logger.config.level          == expected["level"]
+        assert logger.config.runtime_format == expected["runtime_format"]
+        assert logger.config.colors         == LevelColors(**expected["colors"])
 
     @pytest.mark.parametrize("override", [
         {"header_char"  : "=-"},
         {"header_char"  : ""},
         {"header_length": 1},
         {"encoding"     : "not-an-encoding"},
+        {"level"        : "debug"},
+        {"runtime_format": "seconds"},
+        {"colors"       : {"info": "pink"}},
+        {"colors"       : {"warn": "yellow"}},
     ])
     def test_invalid_values_raise(self, tmp_path, override):
-        """Invalid header settings and unknown encodings are rejected on load."""
+        """Invalid values and unknown keys are rejected when the config is loaded."""
         bad_config_path = tmp_path / "bad_config.yaml"
         with open(bad_config_path, "w") as f:
             yaml.safe_dump({"logger": {"folder": str(tmp_path), **override}}, f)
@@ -535,6 +547,320 @@ class TestPrintDataFrameRowCount:
         lines = read_log_lines(log_folder)
         assert lines == []
         assert ret == 0
+
+
+# --------------------------------------------------------------------------
+# reset() and config sources
+# --------------------------------------------------------------------------
+
+class TestResetAndConfigSources:
+    """
+    Tests for Logger.reset() and for passing the configuration as a dict or
+    as a LoggerConfig object instead of a YAML path.
+    """
+
+    def test_reset_discards_instance_and_config(self, logger_instance):
+        logger, _ = logger_instance
+        Logger.reset()
+        assert Logger._instance  is None
+        assert Logger.config     is None
+        assert Logger.start_time == 0.0
+        assert Logger(config={"folder": "./x/"}) is not logger
+
+    def test_reset_restarts_runtime_clock(self, logger_instance):
+        logger, _ = logger_instance
+        Logger.start_time -= 600
+        Logger.reset()
+        Logger(config={})
+        assert time.monotonic() - Logger.start_time < 60
+
+    def test_config_from_dict(self, tmp_path):
+        logger = Logger(config={"folder": str(tmp_path), "level": "warning"})
+        assert logger.config.folder == str(tmp_path)
+        assert logger.config.level  == "warning"
+        # Fields not given fall back to the model defaults.
+        assert logger.config.file_name == "output.log"
+
+    def test_config_from_dict_is_validated(self):
+        with pytest.raises(ValidationError):
+            Logger(config={"unknown_key": 1})
+
+    def test_config_from_logger_config_is_copied(self, tmp_path):
+        """Later changes to the passed object must not affect the logger."""
+        config = LoggerConfig(folder=str(tmp_path), file_name="a.log")
+        logger = Logger(config=config)
+        config.file_name = "changed.log"
+        assert logger.config.file_name == "a.log"
+
+    def test_config_from_path_object(self, config_file):
+        """os.PathLike paths are accepted as well as strings."""
+        import pathlib
+        config_path, _ = config_file
+        logger = Logger(config=pathlib.Path(config_path))
+        assert logger.config.file_name == "output.log"
+
+
+# --------------------------------------------------------------------------
+# Log levels and colors
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def make_logger(tmp_path):
+    """
+    Factory building a Logger that writes to a temporary folder, with the
+    given config overrides. Returns the logger and a function reading the
+    lines of its log file.
+    """
+    def factory(**overrides):
+        logger = Logger(config={"folder": str(tmp_path), **overrides})
+        return logger, lambda: read_log_lines(str(tmp_path), logger.config.file_name)
+    return factory
+
+
+@pytest.fixture
+def force_colors(monkeypatch):
+    """Pretend stdout is a terminal, so that colors are applied."""
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr(Logger, "_useColors", staticmethod(lambda: True))
+
+
+class TestLevels:
+    """
+    Tests for log levels: the level tag in each line, the minimum level,
+    the info()/warning()/error() helpers and the console colors.
+    """
+
+    @pytest.mark.parametrize("level", ["info", "warning", "error"])
+    def test_level_tag_in_line(self, make_logger, level):
+        logger, lines = make_logger()
+        logger.log("Message", cmdline=False, level=level)
+        assert f"[{level.upper():<7}] Message" in lines()[0]
+
+    def test_default_level_is_info(self, make_logger):
+        logger, lines = make_logger()
+        logger.log("Message", cmdline=False)
+        assert "[INFO   ]" in lines()[0]
+
+    def test_helpers_use_their_level(self, make_logger):
+        logger, lines = make_logger()
+        logger.info("a", cmdline=False)
+        logger.warning("b", cmdline=False)
+        logger.error("c", cmdline=False)
+        assert "[INFO   ]" in lines()[0]
+        assert "[WARNING]" in lines()[1]
+        assert "[ERROR  ]" in lines()[2]
+
+    def test_unknown_level_raises(self, make_logger):
+        logger, _ = make_logger()
+        with pytest.raises(ValueError):
+            logger.log("Message", level="debug")
+
+    def test_minimum_level_filters_file_and_console(self, make_logger, capsys):
+        logger, lines = make_logger(level="warning")
+        logger.info("hidden")
+        logger.warning("shown")
+        logger.error("also shown")
+        out = capsys.readouterr().out
+        assert len(lines()) == 2
+        assert "hidden" not in out
+        assert "shown" in out and "also shown" in out
+
+    def test_level_error_only_logs_errors(self, make_logger):
+        logger, lines = make_logger(level="error")
+        logger.info("a", cmdline=False)
+        logger.warning("b", cmdline=False)
+        logger.error("c", cmdline=False)
+        assert len(lines()) == 1
+        assert "c" in lines()[0]
+
+    @pytest.mark.parametrize("level, code", [
+        ("info", "\033[37m"), ("warning", "\033[33m"), ("error", "\033[31m"),
+    ])
+    def test_default_colors_on_console(self, make_logger, capsys, force_colors, level, code):
+        logger, _ = make_logger()
+        logger.log("Colored", level=level)
+        out = capsys.readouterr().out
+        assert out.startswith(code)
+        assert out.rstrip("\n").endswith("\033[0m")
+
+    def test_colors_never_in_file(self, make_logger, force_colors):
+        logger, lines = make_logger()
+        logger.error("Colored")
+        assert "\033[" not in lines()[0]
+
+    def test_custom_color(self, make_logger, capsys, force_colors):
+        logger, _ = make_logger(colors={"info": "green"})
+        logger.info("Green")
+        assert capsys.readouterr().out.startswith("\033[32m")
+
+    def test_color_none_disables_color(self, make_logger, capsys, force_colors):
+        logger, _ = make_logger(colors={"error": "none"})
+        logger.error("Plain")
+        assert "\033[" not in capsys.readouterr().out
+
+    def test_no_colors_when_not_a_terminal(self, make_logger, capsys):
+        """capsys replaces stdout with a non-terminal stream."""
+        logger, _ = make_logger()
+        logger.error("Plain")
+        assert "\033[" not in capsys.readouterr().out
+
+    def test_no_color_env_disables_colors(self, monkeypatch):
+        class FakeTerminal:
+            def isatty(self):
+                return True
+        monkeypatch.setattr("sys.stdout", FakeTerminal())
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        assert Logger._useColors() is True
+        monkeypatch.setenv("NO_COLOR", "1")
+        assert Logger._useColors() is False
+
+    def test_stdout_without_isatty_has_no_colors(self, monkeypatch):
+        monkeypatch.setattr("sys.stdout", object())
+        assert Logger._useColors() is False
+
+
+# --------------------------------------------------------------------------
+# Runtime formats
+# --------------------------------------------------------------------------
+
+class TestRuntimeFormat:
+    """Tests for the "minutes" and "hms" runtime display formats."""
+
+    def test_minutes_format(self, make_logger):
+        logger, lines = make_logger(log_runtime=True, runtime_format="minutes")
+        Logger.start_time = time.monotonic() - 125
+        logger.log("x", cmdline=False)
+        assert "(2 Minutes) x" in lines()[0]
+
+    def test_hms_format(self, make_logger):
+        logger, lines = make_logger(log_runtime=True, runtime_format="hms")
+        Logger.start_time = time.monotonic() - 3723
+        logger.log("x", cmdline=False)
+        assert "(01:02:03) x" in lines()[0]
+
+    def test_format_duration(self):
+        assert Logger._formatDuration(3723.456)               == "01:02:03"
+        assert Logger._formatDuration(3723.456, precise=True) == "01:02:03.46"
+        assert Logger._formatDuration(0.5, precise=True)      == "00:00:00.50"
+
+
+# --------------------------------------------------------------------------
+# exception()
+# --------------------------------------------------------------------------
+
+class TestException:
+    """Tests for Logger.exception() — error level and traceback output."""
+
+    def test_logs_current_exception_with_traceback(self, make_logger):
+        logger, lines = make_logger()
+        try:
+            raise ValueError("bad value")
+        except ValueError:
+            logger.exception("Mapping failed", cmdline=False)
+        content = "".join(lines())
+        assert "[ERROR  ] Mapping failed" in lines()[0]
+        assert "Traceback (most recent call last):" in content
+        assert "ValueError: bad value" in content
+
+    def test_logs_explicit_exception(self, make_logger):
+        logger, lines = make_logger()
+        try:
+            raise KeyError("missing")
+        except KeyError as e:
+            error = e
+        logger.exception("Lookup failed", exc=error, cmdline=False)
+        assert "KeyError: 'missing'" in "".join(lines())
+
+    def test_without_exception_logs_message_only(self, make_logger):
+        logger, lines = make_logger()
+        logger.exception("Nothing raised", cmdline=False)
+        assert len(lines()) == 1
+        assert "[ERROR  ] Nothing raised" in lines()[0]
+
+    def test_without_message_logs_traceback(self, make_logger):
+        logger, lines = make_logger()
+        try:
+            raise RuntimeError("boom")
+        except RuntimeError:
+            logger.exception(cmdline=False)
+        assert "[ERROR  ] Traceback" in lines()[0]
+
+
+# --------------------------------------------------------------------------
+# step()
+# --------------------------------------------------------------------------
+
+class TestStep:
+    """Tests for the Logger.step() context manager."""
+
+    def test_logs_start_and_completion(self, make_logger):
+        logger, lines = make_logger()
+        with logger.step("Loading", cmdline=False):
+            pass
+        assert "Step 'Loading' started." in lines()[0]
+        assert "[INFO   ] Step 'Loading' completed in 00:00:0" in lines()[1]
+
+    def test_failure_is_logged_and_reraised(self, make_logger):
+        logger, lines = make_logger()
+        with pytest.raises(ValueError):
+            with logger.step("Parsing", cmdline=False):
+                raise ValueError("bad row")
+        assert len(lines()) == 2
+        assert "[ERROR  ] Step 'Parsing' failed after" in lines()[1]
+        assert "(ValueError: bad row)" in lines()[1]
+
+    def test_measures_duration(self, make_logger, monkeypatch):
+        logger, lines = make_logger()
+        # Replace the clock seen by the Logger module only, so that the
+        # step appears to take exactly 65.5 seconds.
+        clock = iter([100.0, 165.5])
+        module = sys.modules["logger.Logger"]
+        monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+        with logger.step("Embedding", cmdline=False):
+            pass
+        assert "completed in 00:01:05.50." in lines()[1]
+
+
+# --------------------------------------------------------------------------
+# Thread safety
+# --------------------------------------------------------------------------
+
+class TestThreadSafety:
+    """
+    Tests that concurrent use from several threads yields one instance and
+    complete, non-interleaved log lines and headers.
+    """
+
+    def test_concurrent_instantiation_gives_one_instance(self):
+        instances = []
+        def create():
+            instances.append(Logger(config={"folder": "./data/logs/"}))
+        threads = [threading.Thread(target=create) for _ in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert all(instance is instances[0] for instance in instances)
+
+    def test_concurrent_logging_keeps_lines_intact(self, make_logger):
+        logger, lines = make_logger(header_length=10)
+        def work(n):
+            for i in range(100):
+                logger.log(f"thread {n} line {i}", cmdline=False)
+            logger.printHeader(f"T{n}")
+        threads = [threading.Thread(target=work, args=(n,)) for n in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        content = lines()
+        assert len(content) == 8 * 103
+        assert all(line.endswith("\n") and line.startswith("[") for line in content)
+        # Every header body line is directly surrounded by its two borders.
+        for i, line in enumerate(content):
+            if line.rstrip("\n").endswith("=") and "T" in line:
+                assert content[i - 1].rstrip("\n").endswith("=" * 10)
+                assert content[i + 1].rstrip("\n").endswith("=" * 10)
 
 
 # --------------------------------------------------------------------------

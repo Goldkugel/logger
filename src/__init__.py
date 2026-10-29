@@ -1,4 +1,4 @@
 from .Logger import Logger
-from .LoggerConfig import LoggerConfig
+from .LoggerConfig import LevelColors, LoggerConfig
 
-__all__ = ["Logger", "LoggerConfig"]
+__all__ = ["Logger", "LoggerConfig", "LevelColors"]

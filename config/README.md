@@ -20,9 +20,12 @@ to their other settings; `Logger` reads only that section and ignores the rest.
 | `file_name` | string | `"output.log"` | Name of the log file to write to within `folder`. |
 | `header_char` | string | `"="` | Exactly one character, used to build the border and body lines of a header block printed by `printHeader()`. Repeated `header_length` times for the top and bottom border. |
 | `header_length` | integer | `60` | Total width in characters (at least 2) of the header block printed by `printHeader()`. The body line is padded or truncated to this width too. |
-| `log_runtime` | boolean | `false` | If `true`, each log message is prefixed with the elapsed time in whole minutes since the Logger singleton was first created. Useful for tracking how long individual pipeline steps take. |
+| `log_runtime` | boolean | `false` | If `true`, each log message contains the elapsed time since the Logger singleton was first created, displayed as set by `runtime_format`. Useful for tracking how long individual pipeline steps take. |
 | `format` | string | `"%Y-%m-%d %H:%M:%S"` | `strftime`-style format string controlling how timestamps appear in each log line. See the [Python strftime docs](https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes) for available format codes. |
 | `encoding` | string | `"utf-8"` | Text encoding used when writing the log file. Must be an encoding known to Python (e.g. `"utf-8"`, `"latin-1"`); unknown values are rejected when the config is loaded. |
+| `level` | string | `"info"` | Minimum level a message must have to be logged: `"info"` logs everything, `"warning"` only warnings and errors, `"error"` only errors. Messages below this level are written neither to the file nor to the console. |
+| `runtime_format` | string | `"minutes"` | How the elapsed runtime is displayed when `log_runtime` is enabled: `"minutes"` as `(3 Minutes)`, `"hms"` as `(00:03:12)`. |
+| `colors` | mapping | `info: "white"`, `warning: "yellow"`, `error: "red"` | Console color per level. Allowed colors: `none`, `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`; `none` prints without color. Only the levels `info`, `warning` and `error` are allowed as keys. |
 
 ---
 
@@ -37,6 +40,12 @@ logger:
   log_runtime: true
   format: "%Y-%m-%d %H:%M:%S"
   encoding: "utf-8"
+  level: "info"
+  runtime_format: "minutes"
+  colors:
+    info: "white"
+    warning: "yellow"
+    error: "red"
 ```
 
 ---
@@ -57,10 +66,24 @@ logger:
   ------------------------------------------------------------
   ```
 
-- **`log_runtime`** — when enabled, every log line is prefixed with the number
-  of elapsed minutes since the Logger singleton was first instantiated, e.g.
-  `[2026-09-17 10:32:01] (3 Minutes) Loading completed.` This is useful for
-  rough performance tracking without external profiling tools.
+- **Log line format** — every line has the form
+  `[<timestamp>] [<LEVEL>] (<runtime>) <message>`, e.g.
+  `[2026-09-17 10:32:01] [INFO   ] (3 Minutes) Loading completed.` The level
+  tag is padded to a fixed width so messages of all levels line up. The
+  runtime part is only present if `log_runtime` is enabled.
+
+- **`log_runtime` and `runtime_format`** — the runtime counts from the moment
+  the Logger singleton was first instantiated. `"minutes"` is enough for long
+  pipeline runs; `"hms"` shows seconds as well. For exact timings of single
+  steps, use `Logger().step(...)` instead (see the main README).
+
+- **`level`** — set it to `"warning"` to hide routine progress messages and
+  only keep warnings and errors, e.g. for long batch runs.
+
+- **`colors`** — colors are only applied to console output, never to the log
+  file. They are also left out when the output is redirected to a file or
+  pipe (for example `python run.py > out.txt`, or a batch job's output file)
+  and when the [`NO_COLOR`](https://no-color.org) environment variable is set.
 
 - **`encoding`** — set explicitly so the log output does not depend on the
   system locale; UTF-8 handles any non-ASCII text in log messages.
