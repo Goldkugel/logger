@@ -2,15 +2,16 @@
 Test suite for the Logger class and LoggerConfig model.
 
 Tests cover:
-- Singleton behaviour (__new__, start_time, shared config)
-- Configuration loading (valid YAML, missing file, missing section)
-- log() — file writing, timestamps, runtime, stdout, None handling
-- printHeader() — line count, border characters, return value
+- Singleton behaviour (__new__, start_time, shared config, bare Logger() calls)
+- Configuration loading (valid YAML, missing file, missing section, invalid values)
+- log() — file writing, timestamps, runtime, stdout, None handling, encoding,
+  folder creation
+- printHeader() — line count, border characters, return value, truncation
 - File-processing helper methods (printFileProcessingStart/End, etc.)
 - printDataFrameRowCount() — row count logging, None handling
 
 Run with:
-    pytest src/LoggerTest.py -v
+    pytest tests/LoggerTest.py -v
 
 The real ./config/config.yaml is used as the default configuration for most
 tests. Run pytest from the repository root so that relative paths resolve
@@ -25,6 +26,8 @@ import time
 import pandas   as pd
 import pytest
 import yaml
+
+from pydantic import ValidationError
 
 from logger import Logger
 
@@ -95,8 +98,8 @@ def logger_instance(config_file):
     Build a Logger using the real config file and return it together with
     the log folder path (needed by helper read_log_lines).
 
-    Yields
-    ------
+    Returns
+    -------
     tuple[Logger, str]
         (logger, log_folder)
     """
@@ -182,6 +185,33 @@ class TestSingleton:
         assert logger1 is logger2
         assert logger1.config.file_name == "other.log"
 
+    def test_bare_call_keeps_loaded_config(self, config_file, tmp_path):
+        """
+        Logger() without a path after the first call must keep the
+        configuration loaded earlier instead of re-reading the default
+        ./config/config.yaml.
+        """
+        config_path, _ = config_file
+        other_config_path = tmp_path / "other_config.yaml"
+        with open(other_config_path, "w") as f:
+            yaml.safe_dump({
+                "logger": {
+                    "folder"   : str(tmp_path) + os.sep,
+                    "file_name": "other.log",
+                }
+            }, f)
+
+        Logger(config=str(other_config_path))
+        logger = Logger()
+        assert logger.config.file_name == "other.log"
+
+    def test_bare_first_call_loads_default_config(self, config_file):
+        """The first Logger() call without a path loads ./config/config.yaml."""
+        with open("./config/config.yaml", "r") as f:
+            expected = yaml.safe_load(f)["logger"]
+        logger = Logger()
+        assert logger.config.file_name == expected["file_name"]
+
 
 # --------------------------------------------------------------------------
 # Configuration loading
@@ -209,6 +239,21 @@ class TestConfigLoading:
         assert logger.config.header_length == expected["header_length"]
         assert logger.config.log_runtime   == expected["log_runtime"]
         assert logger.config.format        == expected["format"]
+        assert logger.config.encoding      == expected["encoding"]
+
+    @pytest.mark.parametrize("override", [
+        {"header_char"  : "=-"},
+        {"header_char"  : ""},
+        {"header_length": 1},
+        {"encoding"     : "not-an-encoding"},
+    ])
+    def test_invalid_values_raise(self, tmp_path, override):
+        """Invalid header settings and unknown encodings are rejected on load."""
+        bad_config_path = tmp_path / "bad_config.yaml"
+        with open(bad_config_path, "w") as f:
+            yaml.safe_dump({"logger": {"folder": str(tmp_path), **override}}, f)
+        with pytest.raises(ValidationError):
+            Logger(config=str(bad_config_path))
 
     def test_missing_config_file_raises(self, tmp_path):
         missing_path = str(tmp_path / "does_not_exist.yaml")
@@ -325,6 +370,24 @@ class TestLog:
         assert "First"  in lines[0]
         assert "Second" in lines[1]
 
+    def test_log_writes_non_ascii(self, logger_instance):
+        """Non-ASCII text is written with the configured encoding."""
+        logger, log_folder = logger_instance
+        logger.log("Morbus Crohn – Ödem, Hämatom", cmdline=False)
+        path = os.path.join(log_folder, logger.config.file_name)
+        with open(path, "r", encoding="utf-8") as f:
+            assert "Morbus Crohn – Ödem, Hämatom" in f.read()
+
+    def test_log_creates_missing_folder(self, tmp_path):
+        """The log folder is created on the first log() call if missing."""
+        log_folder  = tmp_path / "nested" / "logs"
+        config_path = tmp_path / "config.yaml"
+        with open(config_path, "w") as f:
+            yaml.safe_dump({"logger": {"folder": str(log_folder)}}, f)
+        logger = Logger(config=str(config_path))
+        logger.log("Created", cmdline=False)
+        assert "Created" in read_log_lines(str(log_folder))[0]
+
 
 # --------------------------------------------------------------------------
 # printHeader()
@@ -371,6 +434,13 @@ class TestPrintHeader:
         expected      = 2 * len(head_foot) + len(body)
         result        = logger.printHeader("Body")
         assert result == expected
+
+    def test_long_text_is_truncated(self, logger_instance):
+        """Text longer than header_length - 2 must not widen the body line."""
+        logger, _     = logger_instance
+        header_length = logger.config.header_length
+        result        = logger.printHeader("x" * (header_length * 2))
+        assert result == 3 * header_length
 
 
 # --------------------------------------------------------------------------

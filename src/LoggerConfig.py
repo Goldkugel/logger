@@ -2,10 +2,13 @@
 Pydantic configuration model for the Logger class.
 
 Defines and validates all settings read from the "logger" section of
-the YAML configuration file. Used exclusively by Logger.__init__.
+the YAML configuration file. Loaded by Logger.__init__; also exported
+from the package so that callers can validate a configuration themselves.
 """
 
-from pydantic import BaseModel, ConfigDict
+import codecs
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class LoggerConfig(BaseModel):
@@ -29,7 +32,7 @@ class LoggerConfig(BaseModel):
     model_config        = ConfigDict(extra="forbid")
 
     # Directory where the log file will be written (relative or absolute path).
-    # The directory must already exist; Logger does not create it automatically.
+    # The directory is created automatically on the first log() call.
     folder: str         = "./data/logs/"
 
     # Name of the log file to write to within `folder`.
@@ -37,22 +40,45 @@ class LoggerConfig(BaseModel):
 
     # Character used to build the header/footer separator line printed by
     # printHeader(). Repeated `header_length` times for the top/bottom border.
-    # Note: config/config.yaml defaults this to "-"; the model default "=" is
-    # only used when no config file sets it.
-    header_char: str    = "="
+    # Must be exactly one character, otherwise borders and body would differ
+    # in width.
+    # Note: config/config.yaml sets this to "-"; the model default "=" is
+    # only used when the config file does not set it.
+    header_char: str    = Field(default="=", min_length=1, max_length=1)
 
     # Total width (in characters) of the header/footer separator line printed
     # by printHeader(). The body line is padded/truncated to this width too.
-    header_length: int  = 60
+    # Must be at least 2 (one header_char on each side of the body).
+    header_length: int  = Field(default=60, ge=2)
 
-    # Whether to prepend each log message with the elapsed runtime in minutes
-    # since the Logger singleton was first created. Useful for tracking how
+    # Whether to prefix each log message (after the timestamp) with the
+    # elapsed runtime in whole minutes since the Logger singleton was first
+    # created. Useful for tracking how
     # long a pipeline step takes.
-    # Note: config/config.yaml defaults this to True; the model default False
-    # is only used when no config file sets it.
+    # Note: config/config.yaml sets this to True; the model default False
+    # is only used when the config file does not set it.
     log_runtime: bool   = False
 
     # strftime-style format string controlling how timestamps are rendered in
     # each log message. See Python's datetime.strftime documentation for the
     # full list of format codes.
     format: str         = "%Y-%m-%d %H:%M:%S"
+
+    # Text encoding used when writing the log file. Set explicitly so the
+    # output does not depend on the system locale.
+    encoding: str       = "utf-8"
+
+    @field_validator("encoding")
+    @classmethod
+    def check_encoding(cls, value: str) -> str:
+        """
+        Reject unknown encodings when the config is loaded, instead of
+        failing later on the first log() call.
+        """
+        # Pydantic only turns ValueError into a ValidationError, so the
+        # LookupError raised for unknown encodings is converted here.
+        try:
+            codecs.lookup(value)
+        except LookupError as e:
+            raise ValueError(f"Unknown encoding '{value}'") from e
+        return value

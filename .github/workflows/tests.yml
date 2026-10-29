@@ -1,0 +1,40 @@
+# Runs the Logger test suite on every push and pull request.
+#
+# The package is installed from the checkout (not in editable mode), so the
+# run also checks that pyproject.toml declares all runtime dependencies.
+# Tests are run from the repository root because they read
+# ./config/config.yaml.
+
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package with test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[test]"
+
+      - name: Check that the package imports without test dependencies
+        run: python -I -c "import sys, logger; assert 'pandas' not in sys.modules"
+
+      - name: Run tests
+        run: python -m pytest tests/LoggerTest.py -v

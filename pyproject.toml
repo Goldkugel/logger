@@ -4,8 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "logger"
-version = "1.0.6"
-dependencies = []
+version = "1.1.0"
+requires-python = ">=3.8"
+dependencies = [
+    "pydantic>=2",
+    "PyYAML",
+]
+
+[project.optional-dependencies]
+test = ["pandas", "pytest"]
 
 [tool.setuptools]
 packages = ["logger"]

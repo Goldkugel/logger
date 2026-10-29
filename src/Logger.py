@@ -1,5 +1,6 @@
 """
-Singleton logging utility for the adapter framework.
+Singleton logging utility shared by the pipeline packages (adapter,
+normalizer, embedder, model, ...).
 
 Provides the Logger class, which reads its configuration from a YAML file,
 writes timestamped log messages to a file, and optionally mirrors them to
@@ -11,11 +12,17 @@ moment the very first Logger() call is made.
 from __future__ import annotations
 
 from datetime       import datetime as dt
+from typing         import TYPE_CHECKING
 from .LoggerConfig  import LoggerConfig
-import pandas       as pd
 import yaml
 import os
 import time
+
+# pandas is only needed for the type hint of printDataFrameRowCount(), which
+# itself only calls len(). Importing it for type checkers only keeps pandas
+# out of the runtime dependencies.
+if TYPE_CHECKING:
+    import pandas   as pd
 
 # Key under which logger settings are expected to live in the YAML config file.
 configuration_section: str = "logger"
@@ -38,22 +45,25 @@ class Logger:
     ----------------------
     config : LoggerConfig or None
         The validated configuration object shared by all callers. Set on
-        first instantiation and overwritten if Logger() is called again
-        with a different config path.
+        first instantiation and overwritten only if Logger() is called
+        again with an explicit config path.
     start_time : float
-        Seconds since epoch recorded when the singleton is first created.
-        Used to compute elapsed runtime in log messages.
+        Monotonic clock value (time.monotonic()) recorded when the singleton
+        is first created. Used to compute elapsed runtime in log messages;
+        unaffected by system clock changes.
     _instance : Logger or None
         The single shared instance, managed by __new__.
     """
 
     # Class-level attributes are intentional here: because Logger is a
     # singleton, config and start_time must be shared across all references
-    # to the same instance. They are set once in __new__ / __init__ and
-    # never duplicated per-instance.
-    config    : LoggerConfig = None
-    start_time: float        = 0.0
-    _instance : Logger       = None
+    # to the same instance. start_time is set once in __new__; config is set
+    # in __init__ on the first call and replaced whenever a config path is
+    # passed explicitly. Both are always assigned on the class, never on the
+    # instance.
+    config    : LoggerConfig | None = None
+    start_time: float               = 0.0
+    _instance : Logger | None       = None
 
     def __new__(cls, *args, **kwargs):
         """
@@ -66,36 +76,51 @@ class Logger:
         if cls._instance is None:
             # No instance exists yet: create it and start the runtime clock.
             cls._instance  = super().__new__(cls)
-            cls.start_time = time.time()
+            cls.start_time = time.monotonic()
 
         # On subsequent calls, return the existing instance instead of a new one.
         return cls._instance
 
-    def __init__(self, config: str = standard_directory):
+    def __init__(self, config: str | None = None):
         """
         Load and validate logger configuration from a YAML file.
 
         Note: __init__ runs every time Logger(...) is called, even though
-        __new__ returns the same singleton instance. Re-instantiating with
-        a different path will therefore reload and overwrite the shared
-        config — intentional, to allow reconfiguration without restarting
-        the process.
+        __new__ returns the same singleton instance. The configuration is
+        therefore only (re)loaded when
+          - no configuration has been loaded yet (first call), or
+          - a config path is passed explicitly.
+        A bare Logger() call after the first one keeps the current
+        configuration, so modules can fetch the singleton without knowing
+        which config file the entry point used. Passing a path explicitly
+        reloads and overwrites the shared config — intentional, to allow
+        reconfiguration without restarting the process.
 
         Parameters
         ----------
-        config : str, optional
-            Path to the YAML configuration file. Defaults to
-            ./config/config.yaml relative to the working directory.
+        config : str or None, optional
+            Path to the YAML configuration file. If None, the current
+            configuration is kept, or ./config/config.yaml (relative to the
+            working directory) is loaded if none has been loaded yet.
         """
+        # Without an explicit path, keep the configuration that is already
+        # loaded; only the very first call falls back to the default path.
+        if config is None:
+            if Logger.config is not None:
+                return
+            config = standard_directory
+
         # Open and parse the YAML config file.
-        with open(config, "r") as f:
+        with open(config, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
 
-        # Extract the "logger" section and validate/coerce it into a
-        # LoggerConfig model. Raises ValidationError if required fields are
-        # missing or invalid, or if unexpected keys are present (per the
-        # model's ConfigDict(extra="forbid") setting).
-        self.config = LoggerConfig.model_validate(data[configuration_section])
+        # Extract the "logger" section and validate it into a LoggerConfig
+        # model. Missing fields fall back to the model defaults. Raises a
+        # KeyError if the file has no "logger" section, and a ValidationError
+        # if a value is invalid or an unknown key is present (per the model's
+        # ConfigDict(extra="forbid") setting). The result is stored on the
+        # class so that all references to the singleton share it.
+        Logger.config = LoggerConfig.model_validate(data[configuration_section])
 
     def log(self, string: str = "", cmdline: bool = True) -> None:
         """
@@ -128,7 +153,7 @@ class Logger:
         # Logger singleton was first created. Useful for tracking pipeline
         # step durations without external profiling tools.
         if self.config.log_runtime:
-            minutes = int((time.time() - self.start_time) // 60)
+            minutes = int((time.monotonic() - self.start_time) // 60)
             message = f"{message}({minutes} Minutes) "
 
         # Append the actual log content after the timestamp/runtime prefix.
@@ -138,9 +163,14 @@ class Logger:
         if cmdline:
             print(message)
 
+        # Create the log folder if it does not exist yet.
+        os.makedirs(self.config.folder, exist_ok=True)
+
         # Append the message to the log file. Opening in "a" (append) mode
-        # ensures that previous log entries are never overwritten.
-        with open(str(path), mode="a") as log_file:
+        # ensures that previous log entries are never overwritten. The
+        # encoding is set explicitly so the output does not depend on the
+        # system locale.
+        with open(str(path), mode="a", encoding=self.config.encoding) as log_file:
             log_file.write(message + "\n")
 
     def printHeader(self, text: str = "") -> int:
@@ -151,6 +181,8 @@ class Logger:
           1. A top border of `header_char` repeated `header_length` times.
           2. A body line: `header_char`, the given text centered within
              `header_length - 2` characters, then another `header_char`.
+             Text longer than `header_length - 2` is truncated so that
+             the body is always exactly as wide as the borders.
           3. A bottom border identical to the top border.
 
         Parameters
@@ -167,11 +199,13 @@ class Logger:
         # Build the top/bottom border by repeating the header character.
         head_foot = self.config.header_char * self.config.header_length
 
-        # Build the body line: header character on each side, text centered
-        # within the remaining width so the body matches the border's total width.
-        body = (
+        # Build the body line: header character on each side, text truncated
+        # and centered within the remaining width so the body matches the
+        # border's total width.
+        width = self.config.header_length - 2
+        body  = (
             f"{self.config.header_char}"
-            f"{text.center(self.config.header_length - 2)}"
+            f"{text[:width].center(width)}"
             f"{self.config.header_char}"
         )
 
@@ -180,8 +214,8 @@ class Logger:
         self.log(body)
         self.log(head_foot)
 
-        # Return the combined character length of all three lines logged,
-        # which callers can use for layout alignment or progress reporting.
+        # Return the combined character length of all three lines logged
+        # (always 3 * header_length, since the body is padded/truncated).
         return 2 * len(head_foot) + len(body)
 
     def printFileProcessingStart(self, file: str = "") -> int:
@@ -223,7 +257,7 @@ class Logger:
         self.log(message)
         return len(message)
 
-    def printDataFrameRowCount(self, data: pd.DataFrame = None) -> int:
+    def printDataFrameRowCount(self, data: pd.DataFrame | None = None) -> int:
         """
         Log the number of rows in a DataFrame.
 
@@ -232,7 +266,8 @@ class Logger:
         Parameters
         ----------
         data : pd.DataFrame or None, optional
-            The DataFrame whose row count to log.
+            The DataFrame whose row count to log. Any object supporting
+            len() works, since only len(data) is used.
 
         Returns
         -------
