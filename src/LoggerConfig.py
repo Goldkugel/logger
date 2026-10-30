@@ -2,7 +2,8 @@
 Pydantic configuration model for the Logger class.
 
 Defines and validates all settings read from the "logger" section of
-the YAML configuration file. Loaded by Logger.__init__; also exported
+the YAML configuration file. Used by Logger to validate any config it is
+given (YAML file, dict or LoggerConfig); also exported
 from the package so that callers can validate a configuration themselves.
 """
 

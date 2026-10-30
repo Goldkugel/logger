@@ -150,7 +150,7 @@ A log file then looks like this:
 
 - **Config loading**: the configuration is loaded on the first `Logger()` call, or whenever a config is passed explicitly. A bare `Logger()` call after that keeps the current configuration; `Logger(config=...)` reloads it and replaces the configuration for all references to the singleton. A YAML file without a `logger` section (or an empty file) raises a `KeyError`; an empty `logger:` section uses the defaults.
 - **Colors**: only console output is colored, and only when stdout is a terminal and `NO_COLOR` is not set; the log file never contains color codes. In notebooks, output is therefore not colored.
-- **Threads and processes**: logging from several threads is safe. Separate processes (e.g. `multiprocessing` workers) each have their own `Logger` with its own runtime clock; their lines go to the same file in the order they are written, without coordination between the processes.
+- **Threads and processes**: logging from several threads is safe. `multiprocessing` workers depend on the start method: with `fork` (the Linux default before Python 3.14) a worker inherits the parent's configuration and runtime clock; with `spawn` or `forkserver` (the default on macOS and Windows, and on Linux from Python 3.14) it starts without a `Logger`, so a bare `Logger()` loads `./config/config.yaml` and starts a new runtime clock — pass the configuration to the worker if it differs. Lines from several processes go to the same file in the order they are written, without coordination between the processes.
 - **Log folder**: the folder configured in `folder` is created automatically on the first `log()` call.
 - **Encoding**: the log file is written with the configured `encoding` (default UTF-8), independent of the system locale.
 - **Header width**: `printHeader` centers `text` within `header_length - 2` characters; longer text is truncated so the header always has the configured width.
@@ -170,7 +170,7 @@ To also see which lines of the package the tests cover:
 pytest tests/LoggerTest.py --cov=logger --cov-report=term-missing
 ```
 
-The tests use `./config/config.yaml` and remove the log file configured there before and after each test. The `test` extra installs `pytest`, `pytest-cov` and `pandas` (used to build test DataFrames).
+Most tests use `./config/config.yaml` and remove the log file configured there before and after each test; the others write to temporary folders. The `test` extra installs `pytest`, `pytest-cov` and `pandas` (used to build test DataFrames).
 
 The tests also run automatically on GitHub Actions for every push and pull request (Python 3.8, 3.11 and 3.14 on Ubuntu 24.04). Each run reports the test coverage in the job log and in the run's summary page; see [`.github/workflows/tests.yml`](./.github/workflows/tests.yml).
 

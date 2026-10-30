@@ -3,13 +3,16 @@ Test suite for the Logger class and LoggerConfig model.
 
 Tests cover:
 - Singleton behaviour (__new__, start_time, shared config, bare Logger() calls)
-- Configuration loading (valid YAML, missing file, missing section, invalid values)
+- Configuration loading (valid YAML, missing file, missing or empty section,
+  empty file, invalid values)
 - log() — file writing, timestamps, runtime, stdout, None handling, encoding,
   folder creation
-- printHeader() — line count, border characters, return value, truncation
+- printHeader() — line count, border characters, return value, truncation,
+  cmdline
 - File-processing helper methods (printFileProcessingStart/End, etc.)
-- printDataFrameRowCount() — row count logging, None handling
-- Logger.reset() and passing the config as a dict or LoggerConfig
+- printDataFrameRowCount() — row count logging, None handling, cmdline
+- Logger.reset() and passing the config as a dict (section or whole
+  configuration), path object or LoggerConfig
 - Log levels, minimum level, level helpers and console colors
 - Runtime display formats ("minutes", "hms")
 - exception() and step()
@@ -226,8 +229,9 @@ class TestConfigLoading:
     """
     Tests for Logger.__init__ and the YAML → LoggerConfig loading path.
 
-    Verifies that valid config files are parsed correctly, and that
-    invalid or missing files raise the expected exceptions.
+    Verifies that valid config files are parsed correctly, that an empty
+    "logger" section falls back to the defaults, and that invalid, empty
+    or missing files raise the expected exceptions.
     """
 
     def test_loads_expected_fields(self, logger_instance):
@@ -274,8 +278,8 @@ class TestConfigLoading:
 
     def test_missing_logger_section_raises(self, tmp_path):
         """
-        A YAML file that has no "logger" key should raise a KeyError when
-        Logger tries to extract data[configuration_section].
+        A YAML file that has no "logger" key should raise a KeyError naming
+        the missing section.
         """
         bad_config_path = tmp_path / "bad_config.yaml"
         with open(bad_config_path, "w") as f:
@@ -425,7 +429,7 @@ class TestLog:
 class TestPrintHeader:
     """
     Tests for Logger.printHeader() — line count, border characters,
-    centered body text, and the integer length returned.
+    centered body text, the integer length returned, and cmdline.
     """
 
     def test_writes_three_lines(self, logger_instance):
@@ -489,7 +493,8 @@ class TestFileProcessingHelpers:
     printWriteFileStart/End.
 
     Verifies that only the basename of the path is logged (not the full
-    directory), and that the return value equals the message length.
+    directory), that the return value equals the message length, and that
+    cmdline=False keeps the message off stdout.
     """
 
     def test_print_file_processing_start(self, logger_instance):
@@ -556,7 +561,8 @@ class TestFileProcessingHelpers:
 class TestPrintDataFrameRowCount:
     """
     Tests for Logger.printDataFrameRowCount() — logs the row count of a
-    DataFrame, or does nothing when None is passed.
+    DataFrame, or does nothing when None is passed; cmdline=False keeps
+    the message off stdout.
     """
 
     def test_logs_row_count_for_non_empty_dataframe(self, logger_instance):
@@ -595,8 +601,8 @@ class TestPrintDataFrameRowCount:
 
 class TestResetAndConfigSources:
     """
-    Tests for Logger.reset() and for passing the configuration as a dict or
-    as a LoggerConfig object instead of a YAML path.
+    Tests for Logger.reset() and for passing the configuration as a dict,
+    a path object or a LoggerConfig instead of a YAML path string.
     """
 
     def test_reset_discards_instance_and_config(self, logger_instance):

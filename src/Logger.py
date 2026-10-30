@@ -2,8 +2,8 @@
 Singleton logging utility shared by the pipeline packages (adapter,
 normalizer, embedder, model, ...).
 
-Provides the Logger class, which reads its configuration from a YAML file,
-writes timestamped log messages to a file, and optionally mirrors them to
+Provides the Logger class, which reads its configuration from a YAML file
+(or a dict or LoggerConfig), writes timestamped log messages to a file, and optionally mirrors them to
 stdout. A singleton pattern ensures that only one Logger instance (and one
 loaded config) exists per process, and that the runtime clock starts at the
 moment the very first Logger() call is made.
@@ -68,8 +68,8 @@ class Logger:
     """
     Singleton logging utility.
 
-    Reads its configuration from a YAML file (validated via LoggerConfig)
-    and writes timestamped log messages to a file, optionally mirroring
+    Reads its configuration from a YAML file, a dict or a LoggerConfig
+    (validated via LoggerConfig) and writes timestamped log messages to a file, optionally mirroring
     them to stdout. Because it's a singleton, only one instance (and one
     loaded config) exists per process, and `start_time` is fixed at the
     moment the first instance is created.
@@ -82,8 +82,8 @@ class Logger:
     ----------------------
     config : LoggerConfig or None
         The validated configuration object shared by all callers. Set on
-        first instantiation and overwritten only if Logger() is called
-        again with an explicit config.
+        first instantiation, overwritten only if Logger() is called again
+        with an explicit config, and cleared by reset().
     start_time : float
         Monotonic clock value (time.monotonic()) recorded when the singleton
         is first created. Used to compute elapsed runtime in log messages;
@@ -104,8 +104,9 @@ class Logger:
     start_time: float               = 0.0
     _instance : Logger | None       = None
 
-    # Re-entrant, because printHeader() and exception() hold the lock while
-    # calling log(), so that their lines stay together.
+    # Re-entrant, because printHeader() holds the lock while calling log()
+    # three times, so that the header lines stay together. (exception()
+    # needs no lock: it logs message and traceback as one entry.)
     _lock     : threading.RLock     = threading.RLock()
 
     def __new__(cls, *args, **kwargs):
@@ -443,7 +444,7 @@ class Logger:
 
     def printHeader(self, text: str = "", cmdline: bool = True) -> int:
         """
-        Print a formatted header block to the log and console.
+        Log a formatted header block, optionally also printing it to stdout.
 
         The header consists of three lines:
           1. A top border of `header_char` repeated `header_length` times.
