@@ -17,9 +17,12 @@ Tests cover:
 - Runtime display formats ("minutes", "hms")
 - exception() and step()
 - Thread safety
+- Multiprocessing (fork and spawn workers)
+- LoggerConfig defaults and package exports
 
-Run with:
-    pytest tests/LoggerTest.py -v
+Run from the repository root with:
+    pytest -v
+(pyproject.toml points pytest at tests/*Test.py.)
 
 The real ./config/config.yaml is used as the default configuration for most
 tests. Run pytest from the repository root so that relative paths resolve
@@ -28,7 +31,9 @@ correctly.
 
 from __future__ import annotations
 
+import multiprocessing
 import os
+import re
 import sys
 import threading
 import time
@@ -41,6 +46,7 @@ import yaml
 
 from pydantic import ValidationError
 
+import logger as logger_package
 from logger import LevelColors, Logger, LoggerConfig
 
 
@@ -305,6 +311,33 @@ class TestConfigLoading:
         assert logger.config == LoggerConfig()
 
 
+    def test_non_mapping_yaml_raises(self, tmp_path):
+        """A YAML file whose top level is not a mapping has no "logger" section."""
+        config_path = tmp_path / "list.yaml"
+        config_path.write_text("- logger\n- other\n")
+        with pytest.raises(KeyError, match="no 'logger' section"):
+            Logger(config=str(config_path))
+
+    def test_full_configuration_file_ignores_other_sections(self, tmp_path):
+        """Only the "logger" section is validated; other packages' sections are ignored."""
+        config_path = tmp_path / "config.yaml"
+        with open(config_path, "w") as f:
+            yaml.safe_dump({
+                "logger"  : {"folder": str(tmp_path), "level": "warning"},
+                "embedder": {"model_id": ["model-a"], "unknown": True},
+            }, f)
+        logger = Logger(config=str(config_path))
+        assert logger.config.level == "warning"
+
+    def test_bare_first_call_without_default_file_raises(self, tmp_path, monkeypatch):
+        """Without ./config/config.yaml in the working directory, Logger() fails."""
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(FileNotFoundError):
+            Logger()
+        # A failed load leaves no configuration behind.
+        assert Logger.config is None
+
+
 # --------------------------------------------------------------------------
 # log()
 # --------------------------------------------------------------------------
@@ -422,6 +455,50 @@ class TestLog:
         assert "Created" in read_log_lines(str(log_folder))[0]
 
 
+    def test_line_format_matches_documentation(self, make_logger):
+        """
+        A line has the documented form
+        [<timestamp>] [<LEVEL>] (<runtime>) <message>.
+        """
+        logger, lines = make_logger(log_runtime=True)
+        logger.warning("Documented", cmdline=False)
+        pattern = (
+            r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] "
+            r"\[WARNING\] \(0 Minutes\) Documented\n$"
+        )
+        assert re.match(pattern, lines()[0])
+
+    def test_custom_timestamp_format(self, make_logger):
+        logger, lines = make_logger(format="%H:%M:%S")
+        logger.log("Time only", cmdline=False)
+        assert re.match(r"^\[\d{2}:\d{2}:\d{2}\] \[INFO   \] Time only$", lines()[0])
+
+    def test_console_line_equals_file_line(self, make_logger, capsys):
+        """Without colors, stdout shows exactly the line written to the file."""
+        logger, lines = make_logger()
+        logger.log("Same on both")
+        assert capsys.readouterr().out == lines()[0]
+
+    def test_configured_encoding_is_used(self, make_logger):
+        logger, _ = make_logger(encoding="latin-1")
+        logger.log("Ödem", cmdline=False)
+        path = os.path.join(logger.config.folder, logger.config.file_name)
+        with open(path, "rb") as f:
+            assert "Ödem".encode("latin-1") in f.read()
+
+    def test_unknown_level_raises_even_for_none(self, make_logger):
+        """The level is checked before None is ignored, so typos are never hidden."""
+        logger, _ = make_logger()
+        with pytest.raises(ValueError):
+            logger.log(None, level="warn")
+
+    @pytest.mark.parametrize("method", ["info", "warning", "error"])
+    def test_level_helpers_ignore_none(self, make_logger, method):
+        logger, lines = make_logger()
+        getattr(logger, method)(None, cmdline=False)
+        assert lines() == []
+
+
 # --------------------------------------------------------------------------
 # printHeader()
 # --------------------------------------------------------------------------
@@ -480,6 +557,29 @@ class TestPrintHeader:
         logger.printHeader("Quiet", cmdline=False)
         assert capsys.readouterr().out == ""
         assert len(read_log_lines(log_folder)) == 3
+
+
+    def test_custom_header_char_and_length(self, make_logger):
+        logger, lines = make_logger(header_char="*", header_length=12)
+        logger.printHeader("Hi", cmdline=False)
+        content = [line.rstrip("\n") for line in lines()]
+        assert content[0].endswith("] " + "*" * 12)
+        assert content[1].endswith("] *    Hi    *")
+        assert content[2].endswith("] " + "*" * 12)
+
+    def test_empty_text_gives_blank_body(self, make_logger):
+        logger, lines = make_logger(header_char="#", header_length=6)
+        logger.printHeader(cmdline=False)
+        assert lines()[1].rstrip("\n").endswith("] #    #")
+
+    def test_header_is_info_and_hidden_above_info(self, make_logger):
+        """
+        Headers are logged with level "info", so a minimum level of
+        "warning" hides them. The return value does not depend on that.
+        """
+        logger, lines = make_logger(level="warning", header_length=10)
+        assert logger.printHeader("Hidden", cmdline=False) == 30
+        assert lines() == []
 
 
 # --------------------------------------------------------------------------
@@ -595,6 +695,13 @@ class TestPrintDataFrameRowCount:
         assert "Row count: 1" in read_log_lines(log_folder)[0]
 
 
+    def test_any_sized_object_works(self, make_logger):
+        """Only len() is used, so pandas is not required."""
+        logger, lines = make_logger()
+        logger.printDataFrameRowCount([1, 2, 3, 4], cmdline=False)
+        assert "Row count: 4" in lines()[0]
+
+
 # --------------------------------------------------------------------------
 # reset() and config sources
 # --------------------------------------------------------------------------
@@ -658,6 +765,23 @@ class TestResetAndConfigSources:
         config_path, _ = config_file
         logger = Logger(config=pathlib.Path(config_path))
         assert logger.config.file_name == "output.log"
+
+
+    def test_full_configuration_dict_is_validated(self):
+        with pytest.raises(ValidationError):
+            Logger(config={"logger": {"unknown_key": 1}})
+
+    def test_old_reference_follows_new_configuration(self, tmp_path):
+        """
+        References kept from before reset() share the class-level state,
+        so they log with the configuration loaded afterwards.
+        """
+        old = Logger(config={"folder": str(tmp_path / "old")})
+        Logger.reset()
+        Logger(config={"folder": str(tmp_path / "new")})
+        old.log("After reset", cmdline=False)
+        assert "After reset" in read_log_lines(str(tmp_path / "new"))[0]
+        assert not (tmp_path / "old").exists()
 
 
 # --------------------------------------------------------------------------
@@ -804,6 +928,15 @@ class TestRuntimeFormat:
         assert Logger._formatDuration(0.5, precise=True)      == "00:00:00.50"
 
 
+    def test_runtime_counts_from_first_call(self, make_logger):
+        """Later Logger() calls with a new config do not restart the clock."""
+        logger, lines = make_logger(log_runtime=True)
+        Logger.start_time = time.monotonic() - 180
+        Logger(config={"folder": logger.config.folder, "log_runtime": True})
+        logger.log("x", cmdline=False)
+        assert "(3 Minutes) x" in lines()[0]
+
+
 # --------------------------------------------------------------------------
 # exception()
 # --------------------------------------------------------------------------
@@ -846,6 +979,36 @@ class TestException:
         assert "[ERROR  ] Traceback" in lines()[0]
 
 
+    def test_logs_chained_exceptions(self, make_logger):
+        logger, lines = make_logger()
+        try:
+            try:
+                raise KeyError("HP:0000001")
+            except KeyError as e:
+                raise RuntimeError("Mapping failed") from e
+        except RuntimeError:
+            logger.exception("Pipeline stopped", cmdline=False)
+        content = "".join(lines())
+        assert "KeyError: 'HP:0000001'" in content
+        assert "direct cause of the following exception" in content
+        assert "RuntimeError: Mapping failed" in content
+
+    def test_traceback_printed_to_console(self, make_logger, capsys):
+        logger, lines = make_logger()
+        try:
+            raise ValueError("bad value")
+        except ValueError:
+            logger.exception("Mapping failed")
+        out = capsys.readouterr().out
+        assert "ValueError: bad value" in out
+        assert out == "".join(lines())
+
+    def test_logged_even_with_minimum_level_error(self, make_logger):
+        logger, lines = make_logger(level="error")
+        logger.exception("Still logged", cmdline=False)
+        assert "[ERROR  ] Still logged" in lines()[0]
+
+
 # --------------------------------------------------------------------------
 # step()
 # --------------------------------------------------------------------------
@@ -879,6 +1042,34 @@ class TestStep:
         with logger.step("Embedding", cmdline=False):
             pass
         assert "completed in 00:01:05.50." in lines()[1]
+
+
+    def test_keyboard_interrupt_is_logged_and_reraised(self, make_logger):
+        """BaseExceptions such as KeyboardInterrupt are logged as failures too."""
+        logger, lines = make_logger()
+        with pytest.raises(KeyboardInterrupt):
+            with logger.step("Waiting", cmdline=False):
+                raise KeyboardInterrupt
+        assert "Step 'Waiting' failed after" in lines()[1]
+        assert "(KeyboardInterrupt: )" in lines()[1]
+
+    def test_prints_to_console(self, make_logger, capsys):
+        logger, _ = make_logger()
+        with logger.step("Loading"):
+            pass
+        out = capsys.readouterr().out
+        assert "Step 'Loading' started." in out
+        assert "Step 'Loading' completed in" in out
+
+    def test_minimum_level_hides_progress_but_not_failure(self, make_logger):
+        logger, lines = make_logger(level="error")
+        with logger.step("Quiet", cmdline=False):
+            pass
+        with pytest.raises(ValueError):
+            with logger.step("Broken", cmdline=False):
+                raise ValueError("bad row")
+        assert len(lines()) == 1
+        assert "Step 'Broken' failed after" in lines()[0]
 
 
 # --------------------------------------------------------------------------
@@ -924,9 +1115,91 @@ class TestThreadSafety:
 
 
 # --------------------------------------------------------------------------
+# Multiprocessing
+# --------------------------------------------------------------------------
+
+def _worker_logger_state(_):
+    """Report the Logger state seen by a multiprocessing worker."""
+    return (
+        Logger._instance is not None,
+        Logger.config.folder if Logger.config else None,
+        Logger.start_time,
+    )
+
+
+def _run_in_worker(method: str):
+    """Run _worker_logger_state in one worker started with `method`."""
+    with multiprocessing.get_context(method).Pool(1) as pool:
+        return pool.apply_async(_worker_logger_state, (0,)).get(timeout=60)
+
+
+class TestMultiprocessing:
+    """
+    Tests for the README note on multiprocessing: what a worker inherits
+    depends on the start method.
+    """
+
+    @pytest.mark.skipif(
+        "fork" not in multiprocessing.get_all_start_methods(),
+        reason="fork is not available on this platform",
+    )
+    def test_fork_worker_inherits_config_and_clock(self, tmp_path):
+        Logger(config={"folder": str(tmp_path)})
+        exists, folder, start_time = _run_in_worker("fork")
+        assert exists
+        assert folder     == str(tmp_path)
+        assert start_time == Logger.start_time
+
+    def test_spawn_worker_starts_without_logger(self, tmp_path):
+        Logger(config={"folder": str(tmp_path)})
+        exists, folder, start_time = _run_in_worker("spawn")
+        assert not exists
+        assert folder     is None
+        assert start_time == 0.0
+
+
+# --------------------------------------------------------------------------
+# LoggerConfig and package exports
+# --------------------------------------------------------------------------
+
+class TestLoggerConfig:
+    """
+    Tests for the LoggerConfig model on its own: the defaults documented
+    in config/README.md and the package exports.
+    """
+
+    def test_documented_defaults(self):
+        config = LoggerConfig()
+        assert config.folder         == "./data/logs/"
+        assert config.file_name      == "output.log"
+        assert config.header_char    == "="
+        assert config.header_length  == 60
+        assert config.log_runtime    is False
+        assert config.format         == "%Y-%m-%d %H:%M:%S"
+        assert config.encoding       == "utf-8"
+        assert config.level          == "info"
+        assert config.runtime_format == "minutes"
+        assert config.colors         == LevelColors(info="white", warning="yellow", error="red")
+
+    def test_unknown_key_rejected(self):
+        with pytest.raises(ValidationError):
+            LoggerConfig(file="output.log")
+
+    def test_header_length_two_is_allowed(self, make_logger):
+        """The minimum width: one header_char on each side, empty body."""
+        logger, lines = make_logger(header_length=2)
+        assert logger.printHeader("Too long", cmdline=False) == 6
+        assert lines()[1].rstrip("\n").endswith("] ==")
+
+    def test_package_exports(self):
+        assert sorted(logger_package.__all__) == ["LevelColors", "Logger", "LoggerConfig"]
+        for name in logger_package.__all__:
+            assert hasattr(logger_package, name)
+
+
+# --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__, "-v"]))

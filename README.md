@@ -161,13 +161,15 @@ The test suite in `tests/` is only meant for testing this repository and is not 
 
 ```bash
 pip install -e ".[test]"
-pytest tests/LoggerTest.py -v
+pytest -v
 ```
 
-To also see which lines of the package the tests cover:
+`pyproject.toml` points pytest at every `tests/*Test.py` file, so `pytest` without arguments runs the whole suite.
+
+To also see which lines and branches of the package the tests cover:
 
 ```bash
-pytest tests/LoggerTest.py --cov=logger --cov-report=term-missing
+pytest --cov=logger --cov-branch --cov-report=term-missing
 ```
 
 Most tests use `./config/config.yaml` and remove the log file configured there before and after each test; the others write to temporary folders. The `test` extra installs `pytest`, `pytest-cov` and `pandas` (used to build test DataFrames).

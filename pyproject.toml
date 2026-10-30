@@ -22,7 +22,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pandas", "pytest", "pytest-cov"]
+test = ["pandas", "pytest>=6", "pytest-cov"]
+
+# The test files are named *Test.py, which pytest does not collect by
+# default; with these settings a plain `pytest` finds them.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["*Test.py"]
 
 [project.urls]
 Repository = "https://github.com/Goldkugel/logger"

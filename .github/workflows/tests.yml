@@ -4,7 +4,8 @@
 # The package is installed from the checkout (not in editable mode), so the
 # run also checks that pyproject.toml declares all runtime dependencies.
 # Tests are run from the repository root because they read
-# ./config/config.yaml.
+# ./config/config.yaml; pytest collects every tests/*Test.py file as set in
+# pyproject.toml, so new test files are run without changing this workflow.
 
 name: Tests
 
@@ -43,9 +44,10 @@ jobs:
         run: python -I -c "import sys, logger; assert 'pandas' not in sys.modules"
 
       # --cov=logger measures the installed package (the code under test),
-      # term-missing lists the uncovered line numbers in the job log.
+      # --cov-branch also checks that both sides of every branch are run,
+      # term-missing lists the uncovered lines and branches in the job log.
       - name: Run tests with coverage
-        run: python -m pytest tests/LoggerTest.py -v --cov=logger --cov-report=term-missing
+        run: python -m pytest -v --cov=logger --cov-branch --cov-report=term-missing
 
       # Also show the coverage table on the run's summary page. Runs even if
       # tests failed, as long as coverage data (.coverage) was written.
