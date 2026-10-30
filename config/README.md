@@ -4,7 +4,8 @@ All logger settings are stored in `config.yaml` under the top-level `logger`
 section and map directly to the `LoggerConfig` Pydantic model. Fields not
 explicitly set fall back to the defaults defined in `LoggerConfig`. Unknown
 keys in the `logger` section are rejected, so typos are caught when the
-configuration is loaded.
+configuration is loaded. Values changed later through `logger.config` are
+validated the same way.
 
 `config.yaml` in this repository only contains the `logger` section. Packages
 that use the logger keep their own `config.yaml` with a `logger` section next
@@ -21,7 +22,7 @@ to their other settings; `Logger` reads only that section and ignores the rest.
 | `header_char` | string | `"="` | Exactly one character, used to build the border and body lines of a header block printed by `printHeader()`. Repeated `header_length` times for the top and bottom border. |
 | `header_length` | integer | `60` | Total width in characters (at least 2) of the header block printed by `printHeader()`. The body line is padded or truncated to this width too. |
 | `log_runtime` | boolean | `false` | If `true`, each log message contains the elapsed time since the Logger singleton was first created, displayed as set by `runtime_format`. Useful for tracking how long individual pipeline steps take. |
-| `format` | string | `"%Y-%m-%d %H:%M:%S"` | `strftime`-style format string controlling how timestamps appear in each log line. See the [Python strftime docs](https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes) for available format codes. |
+| `format` | string | `"%Y-%m-%d %H:%M:%S"` | `strftime`-style format string controlling how timestamps appear in each log line. See the [Python strftime docs](https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes) for available format codes. Formats that `strftime` cannot use, or that end in a single `%`, are rejected when the config is loaded; use `%%` for a literal percent sign. |
 | `encoding` | string | `"utf-8"` | Text encoding used when writing the log file. Must be an encoding known to Python (e.g. `"utf-8"`, `"latin-1"`); unknown values are rejected when the config is loaded. |
 | `level` | string | `"info"` | Minimum level a message must have to be logged: `"info"` logs everything, `"warning"` only warnings and errors, `"error"` only errors. Messages below this level are written neither to the file nor to the console. |
 | `runtime_format` | string | `"minutes"` | How the elapsed runtime is displayed when `log_runtime` is enabled: `"minutes"` as `(3 Minutes)`, `"hms"` as `(00:03:12)`. |
@@ -83,7 +84,8 @@ logger:
 - **`colors`** — colors are only applied to console output, never to the log
   file. They are also left out when the output is redirected to a file or
   pipe (for example `python run.py > out.txt`, or a batch job's output file)
-  and when the [`NO_COLOR`](https://no-color.org) environment variable is set.
+  and when the [`NO_COLOR`](https://no-color.org) environment variable is set
+  to a non-empty value.
 
 - **`encoding`** — set explicitly so the log output does not depend on the
   system locale; UTF-8 handles any non-ASCII text in log messages.

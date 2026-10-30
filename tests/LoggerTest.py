@@ -17,8 +17,9 @@ Tests cover:
 - Runtime display formats ("minutes", "hms")
 - exception() and step()
 - Thread safety
-- Multiprocessing (fork and spawn workers)
-- LoggerConfig defaults and package exports
+- Multiprocessing (fork and spawn workers, fork while another thread logs)
+- LoggerConfig defaults, validated assignments and package exports
+- Console problems (unencodable characters, broken pipe)
 
 Run from the repository root with:
     pytest -v
@@ -31,6 +32,7 @@ correctly.
 
 from __future__ import annotations
 
+import io
 import multiprocessing
 import os
 import re
@@ -38,7 +40,7 @@ import sys
 import threading
 import time
 
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import pandas   as pd
 import pytest
@@ -268,6 +270,8 @@ class TestConfigLoading:
         {"runtime_format": "seconds"},
         {"colors"       : {"info": "pink"}},
         {"colors"       : {"warn": "yellow"}},
+        {"format"       : "%Y-%m-%d %"},
+        {"format"       : "%H:%M %%%"},
     ])
     def test_invalid_values_raise(self, tmp_path, override):
         """Invalid values and unknown keys are rejected when the config is loaded."""
@@ -336,6 +340,12 @@ class TestConfigLoading:
             Logger()
         # A failed load leaves no configuration behind.
         assert Logger.config is None
+
+
+    def test_literal_percent_in_format_is_allowed(self, make_logger):
+        logger, lines = make_logger(format="%H:%M %%")
+        logger.log("x", cmdline=False)
+        assert re.match(r"^\[\d{2}:\d{2} %\] ", lines()[0])
 
 
 # --------------------------------------------------------------------------
@@ -784,6 +794,30 @@ class TestResetAndConfigSources:
         assert not (tmp_path / "old").exists()
 
 
+    def test_config_from_other_mapping(self, tmp_path):
+        """
+        Mappings that are not dicts (e.g. OmegaConf configs) are accepted,
+        including nested ones, instead of being mistaken for a path.
+        """
+        logger = Logger(config=MappingProxyType({
+            "logger": MappingProxyType({
+                "folder": str(tmp_path),
+                "colors": MappingProxyType({"info": "green"}),
+            }),
+        }))
+        assert logger.config.folder      == str(tmp_path)
+        assert logger.config.colors.info == "green"
+
+    def test_old_reference_without_new_call_raises(self, logger_instance):
+        """Logging through an old reference after reset() explains the problem."""
+        logger, _ = logger_instance
+        Logger.reset()
+        with pytest.raises(RuntimeError, match="no configuration"):
+            logger.log("x", cmdline=False)
+        with pytest.raises(RuntimeError, match="no configuration"):
+            logger.printHeader("x", cmdline=False)
+
+
 # --------------------------------------------------------------------------
 # Log levels and colors
 # --------------------------------------------------------------------------
@@ -897,6 +931,9 @@ class TestLevels:
         assert Logger._useColors() is True
         monkeypatch.setenv("NO_COLOR", "1")
         assert Logger._useColors() is False
+        # An empty NO_COLOR is ignored, as https://no-color.org specifies.
+        monkeypatch.setenv("NO_COLOR", "")
+        assert Logger._useColors() is True
 
     def test_stdout_without_isatty_has_no_colors(self, monkeypatch):
         monkeypatch.setattr("sys.stdout", object())
@@ -926,6 +963,17 @@ class TestRuntimeFormat:
         assert Logger._formatDuration(3723.456)               == "01:02:03"
         assert Logger._formatDuration(3723.456, precise=True) == "01:02:03.46"
         assert Logger._formatDuration(0.5, precise=True)      == "00:00:00.50"
+        assert Logger._formatDuration(125.9)                  == "00:02:05"
+
+    @pytest.mark.parametrize("seconds, expected", [
+        (59.999,   "00:01:00.00"),
+        (3599.996, "01:00:00.00"),
+        (0.004,    "00:00:00.00"),
+        (59.994,   "00:00:59.99"),
+    ])
+    def test_format_duration_rounding_carries_over(self, seconds, expected):
+        """Rounding up to a full minute or hour never shows 60 seconds."""
+        assert Logger._formatDuration(seconds, precise=True) == expected
 
 
     def test_runtime_counts_from_first_call(self, make_logger):
@@ -1136,7 +1184,8 @@ def _run_in_worker(method: str):
 class TestMultiprocessing:
     """
     Tests for the README note on multiprocessing: what a worker inherits
-    depends on the start method.
+    depends on the start method, and a forked worker never hangs on the
+    logger's lock.
     """
 
     @pytest.mark.skipif(
@@ -1158,6 +1207,45 @@ class TestMultiprocessing:
         assert start_time == 0.0
 
 
+    @pytest.mark.skipif(
+        "fork" not in multiprocessing.get_all_start_methods(),
+        reason="fork is not available on this platform",
+    )
+    def test_fork_while_another_thread_logs_does_not_hang(self, make_logger):
+        """
+        A worker forked while another thread holds the logger's lock gets a
+        fresh lock; otherwise its first log call would wait forever.
+        """
+        logger, lines = make_logger()
+        held, release = threading.Event(), threading.Event()
+
+        def hold_lock():
+            with Logger._lock:
+                held.set()
+                release.wait(10)
+
+        holder = threading.Thread(target=hold_lock)
+        holder.start()
+        held.wait(10)
+        try:
+            process = multiprocessing.get_context("fork").Process(
+                target=logger.log, args=("From child",), kwargs={"cmdline": False},
+            )
+            process.start()
+            process.join(timeout=20)
+            hung = process.is_alive()
+            if hung:
+                process.kill()
+                process.join()
+        finally:
+            release.set()
+            holder.join()
+
+        assert not hung
+        assert process.exitcode == 0
+        assert any("From child" in line for line in lines())
+
+
 # --------------------------------------------------------------------------
 # LoggerConfig and package exports
 # --------------------------------------------------------------------------
@@ -1165,7 +1253,8 @@ class TestMultiprocessing:
 class TestLoggerConfig:
     """
     Tests for the LoggerConfig model on its own: the defaults documented
-    in config/README.md and the package exports.
+    in config/README.md, validation of values assigned after loading, and
+    the package exports.
     """
 
     def test_documented_defaults(self):
@@ -1195,6 +1284,85 @@ class TestLoggerConfig:
         assert sorted(logger_package.__all__) == ["LevelColors", "Logger", "LoggerConfig"]
         for name in logger_package.__all__:
             assert hasattr(logger_package, name)
+
+
+    @pytest.mark.parametrize("change", [
+        ("level", "debug"),
+        ("header_length", 1),
+        ("encoding", "not-an-encoding"),
+        ("format", "%Y %"),
+        ("runtime_format", "seconds"),
+    ])
+    def test_invalid_assignment_rejected(self, make_logger, change):
+        """Values assigned after loading are validated like loaded ones."""
+        logger, _ = make_logger()
+        field, value = change
+        with pytest.raises(ValidationError):
+            setattr(logger.config, field, value)
+
+    def test_invalid_color_assignment_rejected(self, make_logger):
+        logger, _ = make_logger()
+        with pytest.raises(ValidationError):
+            logger.config.colors.error = "pink"
+
+    def test_valid_assignment_takes_effect(self, make_logger):
+        logger, lines = make_logger()
+        logger.config.level = "error"
+        logger.info("hidden", cmdline=False)
+        logger.error("shown", cmdline=False)
+        assert len(lines()) == 1
+
+
+# --------------------------------------------------------------------------
+# Console problems
+# --------------------------------------------------------------------------
+
+class ClosedPipe:
+    """stdout replacement behaving like a pipe whose reader has exited."""
+
+    def write(self, text):
+        raise BrokenPipeError
+
+    def flush(self):
+        raise BrokenPipeError
+
+
+class TestConsoleProblems:
+    """
+    Tests that problems with the console never lose a line in the log file
+    and are not raised to the caller.
+    """
+
+    def test_unencodable_characters_are_replaced_on_console(self, make_logger, monkeypatch):
+        """The file gets the full text, the console a replacement character."""
+        console = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
+        monkeypatch.setattr("sys.stdout", console)
+        logger, lines = make_logger(encoding="utf-8")
+        logger.log("Ödem")
+        console.flush()
+        assert lines()[0].endswith("] Ödem\n")
+        assert console.buffer.getvalue().endswith(b"] ?dem\n")
+
+    def test_broken_pipe_switches_console_off_and_warns_once(self, make_logger, monkeypatch):
+        monkeypatch.setattr("sys.stdout", ClosedPipe())
+        logger, lines = make_logger()
+        logger.log("First")
+        logger.log("Second")
+        content = lines()
+        assert len(content) == 3
+        assert content[0].endswith("] First\n")
+        assert "[WARNING] Console output is closed (broken pipe)" in content[1]
+        assert content[2].endswith("] Second\n")
+
+    def test_reset_switches_console_on_again(self, make_logger, monkeypatch, capsys):
+        monkeypatch.setattr("sys.stdout", ClosedPipe())
+        logger, _ = make_logger()
+        logger.log("Lost on console")
+        monkeypatch.undo()
+        Logger.reset()
+        logger, _ = make_logger()
+        logger.log("Back on console")
+        assert "Back on console" in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------

@@ -104,7 +104,7 @@ from logger import Logger
 Logger().log("Uses the configuration loaded by the entry point.")
 ```
 
-Instead of a file path, the configuration can also be passed as a dict (either the whole configuration with a `logger` key, or just the contents of the `logger` section) or as a `LoggerConfig` object, which is handy in notebooks and tests:
+Instead of a file path, the configuration can also be passed as a dict or another mapping such as an OmegaConf config (either the whole configuration with a `logger` key, or just the contents of the `logger` section) or as a `LoggerConfig` object, which is handy in notebooks and tests:
 
 ```python
 from logger import Logger, LoggerConfig
@@ -129,8 +129,8 @@ A log file then looks like this:
 
 | Method | Description | Returns |
 |---|---|---|
-| `Logger(config=None)` | Returns the singleton. `config` may be a YAML path, a dict (the whole configuration or just the `logger` section) or a `LoggerConfig`; `None` keeps the loaded configuration. | `Logger` |
-| `Logger.reset()` | Discards the singleton, its configuration and start time. | `None` |
+| `Logger(config=None)` | Returns the singleton. `config` may be a YAML path, a mapping such as a dict (the whole configuration or just the `logger` section) or a `LoggerConfig`; `None` keeps the loaded configuration. | `Logger` |
+| `Logger.reset()` | Discards the singleton, its configuration and start time. References kept from before raise a `RuntimeError` until `Logger()` is called again. | `None` |
 | `log(string, cmdline=True, level="info")` | Writes a timestamped message to the log file; optionally prints to console. `None` is ignored; messages below the configured `level` are dropped. | `None` |
 | `info(string, cmdline=True)` | Same as `log(..., level="info")`. | `None` |
 | `warning(string, cmdline=True)` | Same as `log(..., level="warning")`. | `None` |
@@ -148,9 +148,10 @@ A log file then looks like this:
 
 ## Notes & Potential Gotchas
 
-- **Config loading**: the configuration is loaded on the first `Logger()` call, or whenever a config is passed explicitly. A bare `Logger()` call after that keeps the current configuration; `Logger(config=...)` reloads it and replaces the configuration for all references to the singleton. A YAML file without a `logger` section (or an empty file) raises a `KeyError`; an empty `logger:` section uses the defaults.
-- **Colors**: only console output is colored, and only when stdout is a terminal and `NO_COLOR` is not set; the log file never contains color codes. In notebooks, output is therefore not colored.
-- **Threads and processes**: logging from several threads is safe. `multiprocessing` workers depend on the start method: with `fork` (the Linux default before Python 3.14) a worker inherits the parent's configuration and runtime clock; with `spawn` or `forkserver` (the default on macOS and Windows, and on Linux from Python 3.14) it starts without a `Logger`, so a bare `Logger()` loads `./config/config.yaml` and starts a new runtime clock — pass the configuration to the worker if it differs. Lines from several processes go to the same file in the order they are written, without coordination between the processes.
+- **Config loading**: the configuration is loaded on the first `Logger()` call, or whenever a config is passed explicitly. A bare `Logger()` call after that keeps the current configuration; `Logger(config=...)` reloads it and replaces the configuration for all references to the singleton. A YAML file without a `logger` section (or an empty file) raises a `KeyError`; an empty `logger:` section uses the defaults. Settings changed later through `logger.config` are validated too, so `logger.config.level = "debug"` raises a `ValidationError` right away.
+- **Colors**: only console output is colored, and only when stdout is a terminal and `NO_COLOR` is not set to a non-empty value; the log file never contains color codes. In notebooks, output is therefore not colored.
+- **Threads and processes**: logging from several threads is safe. `multiprocessing` workers depend on the start method: with `fork` (the Linux default before Python 3.14) a worker inherits the parent's configuration and runtime clock, and gets a fresh lock, so it does not hang if another thread was logging at the moment of the fork; with `spawn` or `forkserver` (the default on macOS and Windows, and on Linux from Python 3.14) it starts without a `Logger`, so a bare `Logger()` loads `./config/config.yaml` and starts a new runtime clock — pass the configuration to the worker if it differs. Lines from several processes go to the same file in the order they are written, without coordination between the processes.
+- **Console problems**: each line is written to the log file before it is printed, so console problems never lose it. Characters the console cannot encode are replaced on the console only (e.g. by `?`). If the console stops accepting output, e.g. because the output was piped into `head`, console output is switched off for the rest of the run and a warning is written to the log file; Python may still report the closed pipe on stderr when the program exits.
 - **Log folder**: the folder configured in `folder` is created automatically on the first `log()` call.
 - **Encoding**: the log file is written with the configured `encoding` (default UTF-8), independent of the system locale.
 - **Header width**: `printHeader` centers `text` within `header_length - 2` characters; longer text is truncated so the header always has the configured width.

@@ -9,6 +9,7 @@ from the package so that callers can validate a configuration themselves.
 
 import codecs
 
+from datetime import datetime
 from typing   import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -34,8 +35,9 @@ class LevelColors(BaseModel):
     never to the log file.
     """
 
-    # Reject unknown levels, e.g. a typo such as "warn".
-    model_config = ConfigDict(extra="forbid")
+    # Reject unknown levels, e.g. a typo such as "warn". Values assigned
+    # later (logger.config.colors.error = ...) are validated as well.
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     info: ColorName    = "white"
     warning: ColorName = "yellow"
@@ -59,8 +61,10 @@ class LoggerConfig(BaseModel):
 
     # Reject any keys in the input data that aren't explicitly defined below.
     # This catches typos or outdated config keys early, instead of silently
-    # ignoring them.
-    model_config        = ConfigDict(extra="forbid")
+    # ignoring them. validate_assignment also checks values assigned later
+    # (logger.config.level = ...), which would otherwise only fail on the
+    # next log() call.
+    model_config        = ConfigDict(extra="forbid", validate_assignment=True)
 
     # Directory where the log file will be written (relative or absolute path).
     # The directory is created automatically on the first log() call.
@@ -92,7 +96,7 @@ class LoggerConfig(BaseModel):
 
     # strftime-style format string controlling how timestamps are rendered in
     # each log message. See Python's datetime.strftime documentation for the
-    # full list of format codes.
+    # full list of format codes. Checked by check_format below.
     format: str         = "%Y-%m-%d %H:%M:%S"
 
     # Text encoding used when writing the log file. Set explicitly so the
@@ -125,4 +129,29 @@ class LoggerConfig(BaseModel):
             codecs.lookup(value)
         except LookupError as e:
             raise ValueError(f"Unknown encoding '{value}'") from e
+        return value
+
+    @field_validator("format")
+    @classmethod
+    def check_format(cls, value: str) -> str:
+        """
+        Reject timestamp formats that strftime cannot use, instead of
+        failing (or writing a broken timestamp) on every log() call.
+
+        A "%" at the end, without a format code after it, is rejected on
+        every platform: Linux would write it out literally, Windows would
+        raise on each log() call. ("%%" is a literal percent sign.)
+        """
+        trailing_percents = len(value) - len(value.rstrip("%"))
+        if trailing_percents % 2 == 1:
+            raise ValueError(
+                f"Invalid timestamp format '{value}': '%' at the end has no format code"
+            )
+
+        # strftime raises ValueError for formats the platform rejects
+        # (e.g. unknown codes on Windows, or a NUL character).
+        try:
+            datetime.now().strftime(value)
+        except ValueError as e:
+            raise ValueError(f"Invalid timestamp format '{value}': {e}") from e
         return value
