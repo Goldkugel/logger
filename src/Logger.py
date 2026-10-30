@@ -58,8 +58,9 @@ ansi_colors: dict[str, str] = {
 # ANSI escape code that resets the console color after a colored message.
 ansi_reset: str            = "\033[0m"
 
-# Everything Logger(config=...) accepts: a path to a YAML file, the "logger"
-# section as a dict, or an already validated LoggerConfig.
+# Everything Logger(config=...) accepts: a path to a YAML file, a dict (the
+# whole configuration or just the "logger" section), or an already validated
+# LoggerConfig.
 ConfigSource = Union[str, "os.PathLike[str]", dict, LoggerConfig]
 
 
@@ -144,7 +145,9 @@ class Logger:
         ----------
         config : str, os.PathLike, dict, LoggerConfig or None, optional
             - Path to a YAML file; its "logger" section is loaded.
-            - A dict with the contents of the "logger" section.
+            - A dict: either a whole configuration (the parsed YAML file,
+              with a "logger" key) or just the contents of the "logger"
+              section.
             - A LoggerConfig, used as is (a copy is stored).
             - None: the current configuration is kept, or
               ./config/config.yaml (relative to the working directory) is
@@ -178,8 +181,14 @@ class Logger:
         if isinstance(config, LoggerConfig):
             return config.model_copy(deep=True)
 
-        # A dict is taken to be the contents of the "logger" section.
+        # A dict is either a whole configuration (the parsed YAML file, with
+        # a "logger" key) or the contents of the "logger" section. "logger"
+        # is not a valid logger setting itself, so the two cannot be
+        # confused. An empty section ("logger:" with no keys) means "use all
+        # defaults".
         if isinstance(config, dict):
+            if configuration_section in config:
+                return LoggerConfig.model_validate(config[configuration_section] or {})
             return LoggerConfig.model_validate(config)
 
         # Otherwise it is a path: open and parse the YAML config file and

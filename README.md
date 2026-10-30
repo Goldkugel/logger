@@ -104,12 +104,13 @@ from logger import Logger
 Logger().log("Uses the configuration loaded by the entry point.")
 ```
 
-Instead of a file path, the configuration can also be passed as a dict with the contents of the `logger` section, or as a `LoggerConfig` object — handy in notebooks and tests:
+Instead of a file path, the configuration can also be passed as a dict (either the whole configuration with a `logger` key, or just the contents of the `logger` section) or as a `LoggerConfig` object, which is handy in notebooks and tests:
 
 ```python
 from logger import Logger, LoggerConfig
 
 Logger(config={"folder": "./logs/", "level": "warning"})
+Logger(config={"logger": {"folder": "./logs/"}, "embedder": {...}})
 Logger(config=LoggerConfig(folder="./logs/", runtime_format="hms"))
 
 # Start over with a fresh instance, configuration and runtime clock
@@ -128,7 +129,7 @@ A log file then looks like this:
 
 | Method | Description | Returns |
 |---|---|---|
-| `Logger(config=None)` | Returns the singleton. `config` may be a YAML path, a dict (the `logger` section) or a `LoggerConfig`; `None` keeps the loaded configuration. | `Logger` |
+| `Logger(config=None)` | Returns the singleton. `config` may be a YAML path, a dict (the whole configuration or just the `logger` section) or a `LoggerConfig`; `None` keeps the loaded configuration. | `Logger` |
 | `Logger.reset()` | Discards the singleton, its configuration and start time. | `None` |
 | `log(string, cmdline=True, level="info")` | Writes a timestamped message to the log file; optionally prints to console. `None` is ignored; messages below the configured `level` are dropped. | `None` |
 | `info(string, cmdline=True)` | Same as `log(..., level="info")`. | `None` |

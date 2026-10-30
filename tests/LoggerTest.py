@@ -585,6 +585,20 @@ class TestResetAndConfigSources:
         with pytest.raises(ValidationError):
             Logger(config={"unknown_key": 1})
 
+    def test_config_from_full_configuration_dict(self, tmp_path):
+        """A parsed YAML file with a "logger" key uses that section."""
+        logger = Logger(config={
+            "logger"  : {"folder": str(tmp_path), "level": "error"},
+            "embedder": {"model_id": ["model-a"]},
+        })
+        assert logger.config.folder == str(tmp_path)
+        assert logger.config.level  == "error"
+
+    def test_config_from_full_configuration_dict_with_empty_section(self):
+        """An empty "logger" section falls back to the model defaults."""
+        logger = Logger(config={"logger": None})
+        assert logger.config == LoggerConfig()
+
     def test_config_from_logger_config_is_copied(self, tmp_path):
         """Later changes to the passed object must not affect the logger."""
         config = LoggerConfig(folder=str(tmp_path), file_name="a.log")
