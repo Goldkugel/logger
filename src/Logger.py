@@ -164,10 +164,10 @@ class Logger:
 
             # Stored on the class so that all references to the singleton
             # share it.
-            Logger.config = self._loadConfig(config)
+            Logger.config = self._resolveConfig(config)
 
     @staticmethod
-    def _loadConfig(config: ConfigSource) -> LoggerConfig:
+    def _resolveConfig(config: ConfigSource) -> LoggerConfig:
         """
         Turn any supported config source into a validated LoggerConfig.
 
