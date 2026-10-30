@@ -22,6 +22,7 @@ Tests cover:
 - LoggerConfig defaults, validated assignments and package exports
 - Console problems (unencodable characters, broken pipe)
 - console setting and the {start} placeholder in file_name (one file per run)
+- Reconfiguration: replace=False and the logged change notice
 
 Run from the repository root with:
     pytest -v
@@ -1351,6 +1352,68 @@ class TestFileNamePlaceholder:
     def test_log_file_path_without_config_raises(self):
         with pytest.raises(RuntimeError, match="no configuration"):
             Logger.__new__(Logger).logFilePath()
+
+
+# --------------------------------------------------------------------------
+# Reconfiguration (replace option and change notice)
+# --------------------------------------------------------------------------
+
+class TestReconfiguration:
+    """
+    Tests that library code cannot silently override the entry point's
+    configuration: replace=False only fills in a missing configuration,
+    and every actual change is logged.
+    """
+
+    def test_replace_false_keeps_loaded_config(self, make_logger, tmp_path):
+        logger, lines = make_logger(level="info")
+        Logger(config={"folder": str(tmp_path / "other"), "level": "error"}, replace=False)
+        assert logger.config.level == "info"
+        assert lines() == []
+        assert not (tmp_path / "other").exists()
+
+    def test_replace_false_loads_when_nothing_is_loaded(self, tmp_path):
+        logger = Logger(config={"folder": str(tmp_path)}, replace=False)
+        assert logger.config.folder == str(tmp_path)
+
+    def test_replace_false_without_config_keeps_loaded_config(self, make_logger):
+        logger, _ = make_logger(level="warning")
+        Logger(replace=False)
+        assert logger.config.level == "warning"
+
+    def test_change_is_logged_with_changed_settings(self, make_logger, capsys):
+        logger, lines = make_logger(level="info")
+        Logger(config={"folder": logger.config.folder, "level": "info", "log_runtime": True})
+        assert len(lines()) == 1
+        assert lines()[0].endswith(
+            "Logger configuration changed (log_runtime: False -> True).\n"
+        )
+        assert capsys.readouterr().out.count("configuration changed") == 1
+
+    def test_change_of_file_is_logged_in_both_files(self, make_logger, tmp_path, capsys):
+        logger, old_lines = make_logger()
+        new_folder = tmp_path / "new"
+        Logger(config={"folder": str(new_folder)})
+        new_path = os.path.join(str(new_folder), "output.log")
+        assert old_lines()[0].endswith(f"Further messages go to '{new_path}'.\n")
+        assert "folder: " in old_lines()[0]
+        new_lines = read_log_lines(str(new_folder))
+        assert len(new_lines) == 1
+        assert new_lines[0].endswith(f"-> '{new_folder}').\n")
+        # The note is printed once, not once per file.
+        assert capsys.readouterr().out.count("configuration changed") == 1
+
+    def test_same_config_again_logs_nothing(self, make_logger):
+        logger, lines = make_logger(level="warning")
+        Logger(config={"folder": logger.config.folder, "level": "warning"})
+        assert lines() == []
+
+    def test_invalid_new_config_keeps_old_and_logs_nothing(self, make_logger):
+        logger, lines = make_logger()
+        with pytest.raises(ValidationError):
+            Logger(config={"level": "debug"})
+        assert logger.config.level == "info"
+        assert lines() == []
 
 
 # --------------------------------------------------------------------------

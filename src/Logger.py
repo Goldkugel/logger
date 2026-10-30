@@ -76,8 +76,8 @@ class Logger:
     Singleton logging utility.
 
     Reads its configuration from a YAML file, a dict or a LoggerConfig
-    (validated via LoggerConfig) and writes timestamped log messages to a file, optionally mirroring
-    them to stdout. Because it's a singleton, only one instance (and one
+    (validated via LoggerConfig) and writes timestamped log messages to a
+    file, optionally mirroring them to stdout. Because it's a singleton, only one instance (and one
     loaded config) exists per process, and `start_time` is fixed at the
     moment the first instance is created.
 
@@ -146,7 +146,7 @@ class Logger:
         # On subsequent calls, return the existing instance instead of a new one.
         return cls._instance
 
-    def __init__(self, config: ConfigSource | None = None):
+    def __init__(self, config: ConfigSource | None = None, replace: bool = True):
         """
         Load and validate the logger configuration.
 
@@ -159,7 +159,14 @@ class Logger:
         configuration, so modules can fetch the singleton without knowing
         which config the entry point used. Passing a config explicitly
         reloads and overwrites the shared config — intentional, to allow
-        reconfiguration without restarting the process.
+        reconfiguration without restarting the process. Library code that
+        only wants to provide a fallback passes replace=False, so that it
+        never overrides the configuration of the entry point.
+
+        When a loaded configuration is replaced by a different one, a line
+        naming the changed settings is logged, so that the change is never
+        silent. If the log file changes, the line is written to the old
+        file as well, saying where further messages go.
 
         Parameters
         ----------
@@ -172,6 +179,10 @@ class Logger:
             - None: the current configuration is kept, or
               ./config/config.yaml (relative to the working directory) is
               loaded if none has been loaded yet.
+        replace : bool, optional
+            Whether `config` replaces a configuration that is already
+            loaded (default True). With False, `config` is only used if no
+            configuration has been loaded yet.
         """
         with Logger._lock:
             # Without an explicit config, keep the configuration that is
@@ -182,9 +193,46 @@ class Logger:
                     return
                 config = standard_directory
 
+            # A fallback configuration (replace=False) never overrides one
+            # that is already loaded.
+            if not replace and Logger.config is not None:
+                return
+
+            new = self._resolveConfig(config)
+            old = Logger.config
+
             # Stored on the class so that all references to the singleton
             # share it.
-            Logger.config = self._resolveConfig(config)
+            Logger.config = new
+
+            # Report a change of an already loaded configuration, so that a
+            # package reconfiguring the logger mid-run never goes unnoticed.
+            if old is not None and old != new:
+                self._logConfigChange(old, new)
+
+    def _logConfigChange(self, old: LoggerConfig, new: LoggerConfig) -> None:
+        """
+        Log which settings changed when a configuration was replaced.
+
+        The line is logged with the new configuration. If the log file
+        changed, it is also written to the old file (file only), together
+        with the path of the new one, so that a reader of the old file
+        knows where the run continues.
+        """
+        old_values = old.model_dump()
+        new_values = new.model_dump()
+        changes    = ", ".join(
+            f"{key}: {old_values[key]!r} -> {new_values[key]!r}"
+            for key in new_values
+            if old_values[key] != new_values[key]
+        )
+        note = f"Logger configuration changed ({changes})."
+
+        new_path = self._logFilePath(new)
+        if self._logFilePath(old) != new_path:
+            self._logWith(old, f"{note} Further messages go to '{new_path}'.", False, "info")
+
+        self._logWith(new, note, True, "info")
 
     @staticmethod
     def _resolveConfig(config: ConfigSource) -> LoggerConfig:
@@ -468,8 +516,16 @@ class Logger:
             return
 
         # Read the configuration once, so the whole line uses the same one.
-        config = self._currentConfig()
+        self._logWith(self._currentConfig(), string, cmdline, level)
 
+    def _logWith(self, config: LoggerConfig, string: str, cmdline: bool, level: str) -> None:
+        """
+        Write one log line using `config`; the implementation of log().
+
+        Separate from log() so that a line can be written with a
+        configuration other than the current one (see _logConfigChange())
+        without changing the shared configuration in between.
+        """
         # Drop messages below the configured minimum level.
         if levels[level] < levels[config.level]:
             return
@@ -504,7 +560,7 @@ class Logger:
             # file (the lock is re-entrant).
             show = cmdline and config.console
             if show and self._printToConsole(self._colorize(message, level, config)):
-                self.log(console_closed_message, cmdline=False, level="warning")
+                self._logWith(config, console_closed_message, False, "warning")
 
     def info(self, string: str = "", cmdline: bool = True) -> None:
         """Log a message with level "info". See log()."""
