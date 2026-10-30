@@ -154,6 +154,7 @@ A log file then looks like this:
 - **Console problems**: each line is written to the log file before it is printed, so console problems never lose it. Characters the console cannot encode are replaced on the console only (e.g. by `?`). If the console stops accepting output, e.g. because the output was piped into `head`, console output is switched off for the rest of the run and a warning is written to the log file; Python may still report the closed pipe on stderr when the program exits.
 - **Log folder**: the folder configured in `folder` is created automatically on the first `log()` call.
 - **Encoding**: the log file is written with the configured `encoding` (default UTF-8), independent of the system locale.
+- **Message format**: the messages the logger writes itself are one sentence each, e.g. `Step 'Load' started.`, `Reading file 'hp.obo' completed.` or `Row count: 3.` A step failure gives the error on the same line (`(ValueError: bad row)`); only `exception()` adds the traceback on the following lines.
 - **Header width**: `printHeader` centers `text` within `header_length - 2` characters; longer text is truncated so the header always has the configured width.
 
 ## Tests

@@ -25,7 +25,7 @@ to their other settings; `Logger` reads only that section and ignores the rest.
 | `format` | string | `"%Y-%m-%d %H:%M:%S"` | `strftime`-style format string controlling how timestamps appear in each log line. See the [Python strftime docs](https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes) for available format codes. Formats that `strftime` cannot use, or that end in a single `%`, are rejected when the config is loaded; use `%%` for a literal percent sign. |
 | `encoding` | string | `"utf-8"` | Text encoding used when writing the log file. Must be an encoding known to Python (e.g. `"utf-8"`, `"latin-1"`); unknown values are rejected when the config is loaded. |
 | `level` | string | `"info"` | Minimum level a message must have to be logged: `"info"` logs everything, `"warning"` only warnings and errors, `"error"` only errors. Messages below this level are written neither to the file nor to the console. |
-| `runtime_format` | string | `"minutes"` | How the elapsed runtime is displayed when `log_runtime` is enabled: `"minutes"` as `(3 Minutes)`, `"hms"` as `(00:03:12)`. |
+| `runtime_format` | string | `"minutes"` | How the elapsed runtime is displayed when `log_runtime` is enabled: `"minutes"` as `(3 Minutes)` (or `(1 Minute)`), `"hms"` as `(00:03:12)`. |
 | `colors` | mapping | `info: "white"`, `warning: "yellow"`, `error: "red"` | Console color per level. Allowed colors: `none`, `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`; `none` prints without color. Only the levels `info`, `warning` and `error` are allowed as keys. |
 
 ---

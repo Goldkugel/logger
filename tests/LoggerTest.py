@@ -10,6 +10,7 @@ Tests cover:
 - printHeader() — line count, border characters, return value, truncation,
   cmdline
 - File-processing helper methods (printFileProcessingStart/End, etc.)
+- One common structure for all messages the logger writes itself
 - printDataFrameRowCount() — row count logging, None handling, cmdline
 - Logger.reset() and passing the config as a dict (section or whole
   configuration), path object or LoggerConfig
@@ -509,6 +510,37 @@ class TestLog:
         assert lines() == []
 
 
+    def test_built_in_messages_share_one_structure(self, make_logger):
+        """
+        Every message the logger writes itself is one line of the form
+        [<timestamp>] [<LEVEL>] (<runtime>) <sentence ending in ".">.
+        (Header lines and exception() tracebacks are tested separately.)
+        """
+        logger, lines = make_logger(log_runtime=True)
+        logger.printFileProcessingStart("/a/in.csv", cmdline=False)
+        logger.printFileProcessingEnd("/a/in.csv", cmdline=False)
+        logger.printReadFileStart("in.csv", cmdline=False)
+        logger.printReadFileEnd("in.csv", cmdline=False)
+        logger.printWriteFileStart("out.csv", cmdline=False)
+        logger.printWriteFileEnd("out.csv", cmdline=False)
+        logger.printDataFrameRowCount([1, 2, 3], cmdline=False)
+        logger.exception(cmdline=False)
+        with logger.step("Load", cmdline=False):
+            pass
+        for error in (ValueError("bad\nrow"), KeyboardInterrupt()):
+            with pytest.raises(BaseException):
+                with logger.step("Map", cmdline=False):
+                    raise error
+        pattern = re.compile(
+            r"^\[[^\]]+\] \[(INFO   |WARNING|ERROR  )\] \(\d+ Minutes?\) "
+            r"[A-Za-z(][^\n]*[^.]\.\n$"
+        )
+        content = lines()
+        assert len(content) == 14
+        for line in content:
+            assert pattern.match(line), line
+
+
 # --------------------------------------------------------------------------
 # printHeader()
 # --------------------------------------------------------------------------
@@ -611,8 +643,8 @@ class TestFileProcessingHelpers:
         logger, log_folder = logger_instance
         ret = logger.printFileProcessingStart("/path/to/input_data.csv")
         lines = read_log_lines(log_folder)
-        assert "Processing file 'input_data.csv'." in lines[0]
-        assert ret == len("Processing file 'input_data.csv'...")
+        assert lines[0].endswith(" Processing file 'input_data.csv' started.\n")
+        assert ret == len("Processing file 'input_data.csv' started.")
 
     def test_print_file_processing_end(self, logger_instance):
         logger, log_folder = logger_instance
@@ -624,7 +656,7 @@ class TestFileProcessingHelpers:
         logger, log_folder = logger_instance
         logger.printReadFileStart("data.csv")
         lines = read_log_lines(log_folder)
-        assert "Reading file 'data.csv'." in lines[0]
+        assert lines[0].endswith(" Reading file 'data.csv' started.\n")
 
     def test_print_read_file_end(self, logger_instance):
         logger, log_folder = logger_instance
@@ -636,7 +668,7 @@ class TestFileProcessingHelpers:
         logger, log_folder = logger_instance
         logger.printWriteFileStart("data.csv")
         lines = read_log_lines(log_folder)
-        assert "Writing file 'data.csv'." in lines[0]
+        assert lines[0].endswith(" Writing file 'data.csv' started.\n")
 
     def test_print_write_file_end(self, logger_instance):
         logger, log_folder = logger_instance
@@ -680,8 +712,8 @@ class TestPrintDataFrameRowCount:
         df  = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
         ret = logger.printDataFrameRowCount(df)
         lines = read_log_lines(log_folder)
-        assert "Row count: 3" in lines[0]
-        assert ret == len("Row count: 3")
+        assert lines[0].endswith(" Row count: 3.\n")
+        assert ret == len("Row count: 3.")
 
     def test_logs_row_count_for_empty_dataframe(self, logger_instance):
         logger, log_folder = logger_instance
@@ -953,6 +985,12 @@ class TestRuntimeFormat:
         logger.log("x", cmdline=False)
         assert "(2 Minutes) x" in lines()[0]
 
+    def test_minutes_format_singular(self, make_logger):
+        logger, lines = make_logger(log_runtime=True, runtime_format="minutes")
+        Logger.start_time = time.monotonic() - 65
+        logger.log("x", cmdline=False)
+        assert "(1 Minute) x" in lines()[0]
+
     def test_hms_format(self, make_logger):
         logger, lines = make_logger(log_runtime=True, runtime_format="hms")
         Logger.start_time = time.monotonic() - 3723
@@ -1017,6 +1055,14 @@ class TestException:
         logger.exception("Nothing raised", cmdline=False)
         assert len(lines()) == 1
         assert "[ERROR  ] Nothing raised" in lines()[0]
+
+    def test_without_message_or_exception_logs_note(self, make_logger):
+        """No empty error line: a note says what happened instead."""
+        logger, lines = make_logger()
+        logger.exception(cmdline=False)
+        assert lines()[0].endswith(
+            "] exception() was called without a message or an active exception.\n"
+        )
 
     def test_without_message_logs_traceback(self, make_logger):
         logger, lines = make_logger()
@@ -1092,6 +1138,19 @@ class TestStep:
         assert "completed in 00:01:05.50." in lines()[1]
 
 
+    def test_multi_line_error_stays_on_one_line(self, make_logger):
+        logger, lines = make_logger()
+        with pytest.raises(ValueError):
+            with logger.step("Parsing", cmdline=False):
+                raise ValueError("bad row\n  in line 12")
+        assert len(lines()) == 2
+        assert lines()[1].endswith("(ValueError: bad row in line 12).\n")
+
+    def test_describe_error(self):
+        assert Logger._describeError(KeyError("HP:1"))     == "KeyError: 'HP:1'"
+        assert Logger._describeError(ValueError(""))       == "ValueError"
+        assert Logger._describeError(ValueError("a\n\nb")) == "ValueError: a b"
+
     def test_keyboard_interrupt_is_logged_and_reraised(self, make_logger):
         """BaseExceptions such as KeyboardInterrupt are logged as failures too."""
         logger, lines = make_logger()
@@ -1099,7 +1158,7 @@ class TestStep:
             with logger.step("Waiting", cmdline=False):
                 raise KeyboardInterrupt
         assert "Step 'Waiting' failed after" in lines()[1]
-        assert "(KeyboardInterrupt: )" in lines()[1]
+        assert lines()[1].endswith("(KeyboardInterrupt).\n")
 
     def test_prints_to_console(self, make_logger, capsys):
         logger, _ = make_logger()

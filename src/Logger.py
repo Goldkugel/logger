@@ -284,14 +284,16 @@ class Logger:
     def _formatRuntime(self, config: LoggerConfig) -> str:
         """
         Format the elapsed runtime since the singleton was created, in the
-        configured `runtime_format`: "3 Minutes" or "00:03:12".
+        configured `runtime_format`: "3 Minutes" (or "1 Minute") or
+        "00:03:12".
         """
         elapsed = time.monotonic() - self.start_time
 
         if config.runtime_format == "hms":
             return self._formatDuration(elapsed)
 
-        return f"{int(elapsed // 60)} Minutes"
+        minutes = int(elapsed // 60)
+        return f"{minutes} {'Minute' if minutes == 1 else 'Minutes'}"
 
     @staticmethod
     def _useColors() -> bool:
@@ -469,6 +471,19 @@ class Logger:
         """Log a message with level "error". See log()."""
         self.log(string, cmdline, level="error")
 
+    @staticmethod
+    def _describeError(error: BaseException) -> str:
+        """
+        Describe an exception on one line: "ValueError: bad row".
+
+        Without a message, only the type is given ("KeyboardInterrupt").
+        A message spanning several lines is joined with spaces, so that the
+        log line keeps the common one-line structure.
+        """
+        text = " ".join(line.strip() for line in str(error).splitlines() if line.strip())
+        name = type(error).__name__
+        return f"{name}: {text}" if text else name
+
     def exception(
         self,
         string: str = "",
@@ -482,7 +497,8 @@ class Logger:
         being handled, or pass the exception explicitly via `exc`. The
         traceback lines follow the message line in the log file, without a
         timestamp prefix of their own. If there is no exception, only the
-        message is logged.
+        message is logged; if there is neither, a note saying so is logged,
+        so that no empty error line is written.
 
         Parameters
         ----------
@@ -507,6 +523,8 @@ class Logger:
 
         # Message and traceback form a single, multi-line log entry.
         parts = [part for part in (string, trace) if part]
+        if not parts:
+            parts = ["exception() was called without a message or an active exception."]
         self.log("\n".join(parts), cmdline, level="error")
 
     @contextmanager
@@ -520,8 +538,9 @@ class Logger:
 
         Logs "Step 'Loading SCT' started." on entry and
         "Step 'Loading SCT' completed in 00:01:23.45." on exit. If the block
-        raises, an error "Step 'Loading SCT' failed after ... (<error>)." is
-        logged and the exception is re-raised unchanged.
+        raises, an error "Step 'Loading SCT' failed after 00:00:01.20
+        (ValueError: bad row)." is logged on one line (see _describeError())
+        and the exception is re-raised unchanged.
 
         Parameters
         ----------
@@ -538,7 +557,7 @@ class Logger:
         except BaseException as e:
             duration = self._formatDuration(time.monotonic() - start, precise=True)
             self.log(
-                f"Step '{name}' failed after {duration} ({type(e).__name__}: {e}).",
+                f"Step '{name}' failed after {duration} ({self._describeError(e)}).",
                 cmdline,
                 level="error",
             )
@@ -604,7 +623,8 @@ class Logger:
         self, action: str, file: str, completed: bool, cmdline: bool = True
     ) -> int:
         """
-        Log "<action> file '<name>'..." or "<action> file '<name>' completed.".
+        Log "<action> file '<name>' started." or "<action> file '<name>' completed.",
+        matching the wording of step().
 
         Shared implementation of the printFileProcessing*, printReadFile*
         and printWriteFile* helpers. Only the basename of `file` is logged —
@@ -615,8 +635,8 @@ class Logger:
         int
             Length of the logged message string.
         """
-        suffix  = " completed." if completed else "..."
-        message = f"{action} file '{os.path.basename(file)}'{suffix}"
+        event   = "completed" if completed else "started"
+        message = f"{action} file '{os.path.basename(file)}' {event}."
         self.log(message, cmdline)
         return len(message)
 
@@ -681,7 +701,7 @@ class Logger:
         ret = 0
 
         if data is not None:
-            message = f"Row count: {len(data)}"
+            message = f"Row count: {len(data)}."
             self.log(message, cmdline)
             ret = len(message)
 
