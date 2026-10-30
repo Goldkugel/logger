@@ -13,9 +13,10 @@ from __future__ import annotations
 
 from contextlib     import contextmanager
 from datetime       import datetime as dt
-from typing         import TYPE_CHECKING, Any, Iterator, Mapping, Union
+from typing         import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Union
 from .LoggerConfig  import LoggerConfig
 import yaml
+import logging
 import os
 import sys
 import threading
@@ -63,6 +64,14 @@ ansi_reset: str            = "\033[0m"
 # an already validated LoggerConfig.
 ConfigSource = Union[str, "os.PathLike[str]", Mapping[str, Any], LoggerConfig]
 
+# Levels of Python's standard logging module matching the Logger levels,
+# used by captureStandardLogging().
+standard_levels: dict[str, int] = {
+    "info"   : logging.INFO,
+    "warning": logging.WARNING,
+    "error"  : logging.ERROR,
+}
+
 # Warning logged once when the console stops accepting output, e.g. because
 # the program's output was piped into `head`.
 console_closed_message: str = (
@@ -107,6 +116,9 @@ class Logger:
     _console_closed : bool
         Set once stdout has stopped accepting output (broken pipe); console
         output is skipped from then on.
+    _standard_handler, _standard_targets
+        The handler installed by captureStandardLogging() and the standard
+        loggers it was added to; removed again by releaseStandardLogging().
     """
 
     # Class-level attributes are intentional here: because Logger is a
@@ -126,6 +138,11 @@ class Logger:
     _lock     : threading.RLock     = threading.RLock()
 
     _console_closed: bool           = False
+
+    # Handler installed by captureStandardLogging(), and the standard
+    # loggers it was added to, each with the level it had before.
+    _standard_handler: StandardLoggingHandler | None    = None
+    _standard_targets: list[tuple[logging.Logger, int]] = []
 
     def __new__(cls, *args, **kwargs):
         """
@@ -300,7 +317,8 @@ class Logger:
     @classmethod
     def reset(cls) -> None:
         """
-        Discard the singleton, its configuration and its start time.
+        Discard the singleton, its configuration and its start time, and
+        stop capturing standard logging (see releaseStandardLogging()).
 
         The next Logger() call creates a fresh instance, loads the
         configuration again and restarts the runtime clock. Mainly useful
@@ -308,6 +326,7 @@ class Logger:
         class-level state, so they work again once Logger() has been called.
         """
         with cls._lock:
+            cls.releaseStandardLogging()
             cls._instance       = None
             cls.config          = None
             cls.start_time      = 0.0
@@ -669,6 +688,98 @@ class Logger:
         duration = self._formatDuration(time.monotonic() - start, precise=True)
         self.log(f"Step '{name}' completed in {duration}.", cmdline)
 
+    def captureStandardLogging(
+        self,
+        level: str = "warning",
+        loggers: Iterable[str] | str = ("",),
+        cmdline: bool = True,
+    ) -> logging.Handler:
+        """
+        Write messages of Python's standard logging module to this log.
+
+        Libraries such as torch, transformers or vLLM report through the
+        standard logging module, so their warnings would otherwise only
+        appear on stderr and never in the log file. After this call, their
+        records of at least `level` are logged here as
+        "<logger name>: <message>", with the matching Logger level and the
+        traceback of an exception, if any. The Logger's own minimum level
+        and `console` setting apply as usual.
+
+        Calling it again replaces the previous capture. Undo it with
+        releaseStandardLogging(); Logger.reset() does so as well.
+
+        Parameters
+        ----------
+        level : str, optional
+            Minimum level of the captured records: "info", "warning"
+            (default) or "error". If a standard logger would drop records
+            of this level, its level is lowered (and restored on release).
+        loggers : iterable of str or str, optional
+            Names of the standard loggers to capture; the default "" is the
+            root logger, which receives the records of all loggers that
+            propagate to it. Add the names of loggers that do not propagate
+            (e.g. "vllm"), and consider cmdline=False for them, since they
+            print to the console themselves.
+        cmdline : bool, optional
+            Whether captured records are also printed to stdout (default
+            True). Without other handlers, the standard logging module
+            prints warnings to stderr only until this capture is installed,
+            so they are not shown twice.
+
+        Returns
+        -------
+        logging.Handler
+            The installed handler.
+
+        Raises
+        ------
+        ValueError
+            If `level` is not one of the supported levels.
+        """
+        if level not in standard_levels:
+            raise ValueError(
+                f"Unknown log level '{level}', expected one of {list(standard_levels)}"
+            )
+
+        # A single name is a common mistake for a list of names; iterating
+        # over it would capture the loggers "v", "l", "l", "m".
+        names = [loggers] if isinstance(loggers, str) else list(loggers)
+
+        with Logger._lock:
+            Logger.releaseStandardLogging()
+
+            handler = StandardLoggingHandler(self, cmdline)
+            handler.setLevel(standard_levels[level])
+
+            for name in names:
+                target = logging.getLogger(name)
+                Logger._standard_targets.append((target, target.level))
+                target.addHandler(handler)
+                # Records below the logger's level are never created, so
+                # lower it if it would hide the requested level.
+                if target.getEffectiveLevel() > handler.level:
+                    target.setLevel(handler.level)
+
+            Logger._standard_handler = handler
+
+        return handler
+
+    @classmethod
+    def releaseStandardLogging(cls) -> None:
+        """
+        Stop capturing standard logging (see captureStandardLogging()).
+
+        Removes the handler from the standard loggers and restores their
+        previous levels. Does nothing if nothing is captured.
+        """
+        with cls._lock:
+            for target, previous_level in cls._standard_targets:
+                target.removeHandler(cls._standard_handler)
+                target.setLevel(previous_level)
+
+            cls._standard_handler = None
+            cls._standard_targets = []
+
     def printHeader(self, text: str = "", cmdline: bool = True) -> int:
         """
         Log a formatted header block, optionally also printing it to stdout.
@@ -881,6 +992,47 @@ class Logger:
             Length of the logged message string.
         """
         return self._logFileEvent("Writing", file, completed=True, cmdline=cmdline)
+
+
+class StandardLoggingHandler(logging.Handler):
+    """
+    Handler of Python's standard logging module that writes records to a
+    Logger. Installed by Logger.captureStandardLogging().
+    """
+
+    def __init__(self, logger: Logger, cmdline: bool = True):
+        super().__init__()
+        self._logger  = logger
+        self._cmdline = cmdline
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """
+        Log `record` as "<logger name>: <message>" with the matching level:
+        DEBUG and INFO as "info", WARNING as "warning", ERROR and CRITICAL
+        as "error". The traceback of an attached exception follows on the
+        next lines, as with Logger.exception().
+        """
+        try:
+            message = record.getMessage()
+            if record.exc_info and record.exc_info[1] is not None:
+                trace   = "".join(traceback.format_exception(*record.exc_info))
+                message = f"{message}\n{trace.rstrip()}"
+
+            if record.levelno >= logging.ERROR:
+                level = "error"
+            elif record.levelno >= logging.WARNING:
+                level = "warning"
+            else:
+                level = "info"
+
+            self._logger.log(f"{record.name}: {message}", self._cmdline, level=level)
+        except RecursionError:
+            raise
+        except Exception:
+            # The standard way for handlers to report their own failures
+            # (prints "--- Logging error ---" to stderr) instead of raising
+            # into the code that logged the record.
+            self.handleError(record)
 
 
 # Give forked child processes (e.g. multiprocessing workers started with

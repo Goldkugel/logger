@@ -13,6 +13,7 @@ A lightweight, singleton-based logging utility for Python projects that writes t
 - **Step timing** — `with logger.step("..."):` logs the start, end and exact duration of a block.
 - **Exception logging** — `logger.exception(...)` writes the full traceback to the log file.
 - **Thread-safe** — lines from different threads are never interleaved.
+- **Standard logging capture** — `captureStandardLogging()` writes warnings of libraries that use Python's `logging` module (torch, transformers, vLLM, ...) to the same log file.
 - **No silent reconfiguration** — library code can pass its config with `replace=False`, and every change of a loaded configuration is logged.
 - **Formatted headers** — print a bordered header block to visually separate sections in the log.
 - **Convenience helpers** — pre-built methods for common logging patterns (file processing, reading, writing, DataFrame row counts).
@@ -131,6 +132,19 @@ Logger(config=config_path, replace=False)
 
 Whenever a loaded configuration is replaced by a different one, the logger logs which settings changed, for example `Logger configuration changed (level: 'info' -> 'warning').` If the log file changes, the old file gets that line too, followed by the path of the new file.
 
+### Capturing Python's standard logging
+
+Libraries such as torch, transformers or vLLM report through Python's `logging` module, so their warnings normally only appear on stderr. To write them to the log file as well:
+
+```python
+logger = Logger(config="./config/config.yaml")
+logger.captureStandardLogging()                    # warnings and errors of all propagating loggers
+logger.captureStandardLogging(level="info")        # also info records
+logger.captureStandardLogging(loggers=["", "vllm"], cmdline=False)  # add a logger that does not propagate
+```
+
+Captured records appear as `<logger name>: <message>` with the matching level, e.g. `[WARNING] transformers.modeling_utils: Some weights were not initialized.` The Logger's own `level` and `console` settings apply as usual. `Logger.releaseStandardLogging()` (or `Logger.reset()`) undoes the capture and restores the levels of the standard loggers.
+
 A log file then looks like this:
 
 ```
@@ -144,7 +158,9 @@ A log file then looks like this:
 | Method | Description | Returns |
 |---|---|---|
 | `Logger(config=None, replace=True)` | Returns the singleton. `config` may be a YAML path, a mapping such as a dict (the whole configuration or just the `logger` section) or a `LoggerConfig`; `None` keeps the loaded configuration. With `replace=False`, `config` is only used if no configuration is loaded yet. A change of a loaded configuration is logged. | `Logger` |
-| `Logger.reset()` | Discards the singleton, its configuration and start time. References kept from before raise a `RuntimeError` until `Logger()` is called again. | `None` |
+| `Logger.reset()` | Discards the singleton, its configuration and start time, and stops capturing standard logging. References kept from before raise a `RuntimeError` until `Logger()` is called again. | `None` |
+| `captureStandardLogging(level="warning", loggers=("",), cmdline=True)` | Writes records of Python's `logging` module of at least `level` to this log, from the root logger (`""`) and any other named loggers. Calling it again replaces the previous capture. | `logging.Handler` |
+| `Logger.releaseStandardLogging()` | Stops capturing standard logging and restores the levels of the standard loggers. | `None` |
 | `log(string, cmdline=True, level="info")` | Writes a timestamped message to the log file; optionally prints to console. `None` is ignored; messages below the configured `level` are dropped. | `None` |
 | `info(string, cmdline=True)` | Same as `log(..., level="info")`. | `None` |
 | `warning(string, cmdline=True)` | Same as `log(..., level="warning")`. | `None` |

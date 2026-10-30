@@ -23,6 +23,7 @@ Tests cover:
 - Console problems (unencodable characters, broken pipe)
 - console setting and the {start} placeholder in file_name (one file per run)
 - Reconfiguration: replace=False and the logged change notice
+- Capturing Python's standard logging module
 
 Run from the repository root with:
     pytest -v
@@ -36,6 +37,7 @@ correctly.
 from __future__ import annotations
 
 import io
+import logging
 import multiprocessing
 import os
 import re
@@ -1414,6 +1416,122 @@ class TestReconfiguration:
             Logger(config={"level": "debug"})
         assert logger.config.level == "info"
         assert lines() == []
+
+
+# --------------------------------------------------------------------------
+# Standard logging capture
+# --------------------------------------------------------------------------
+
+class TestStandardLogging:
+    """
+    Tests for captureStandardLogging(): records of Python's standard logging
+    module (as used by torch, transformers or vLLM) end up in the log file.
+    """
+
+    def test_warning_is_captured_with_logger_name(self, make_logger):
+        logger, lines = make_logger()
+        logger.captureStandardLogging(cmdline=False)
+        logging.getLogger("lib.part").warning("Disk %s is %d%% full", "/data", 91)
+        assert lines()[0].endswith("[WARNING] lib.part: Disk /data is 91% full\n")
+
+    def test_levels_are_mapped(self, make_logger):
+        logger, lines = make_logger()
+        logger.captureStandardLogging(level="info", cmdline=False)
+        library = logging.getLogger("lib.levels")
+        library.info("i")
+        library.warning("w")
+        library.error("e")
+        library.critical("c")
+        tags = [line.split("] ")[1] for line in lines()]
+        assert tags == ["[INFO   ", "[WARNING", "[ERROR  ", "[ERROR  "]
+
+    def test_records_below_level_are_ignored(self, make_logger):
+        logger, lines = make_logger()
+        logger.captureStandardLogging(level="warning", cmdline=False)
+        logging.getLogger("lib.quiet").info("hidden")
+        assert lines() == []
+
+    def test_info_level_lowers_and_restores_logger_level(self, make_logger):
+        logger, lines = make_logger()
+        root     = logging.getLogger()
+        previous = root.level
+        logger.captureStandardLogging(level="info", cmdline=False)
+        logging.getLogger("lib.info").info("shown")
+        assert "lib.info: shown" in lines()[0]
+        Logger.releaseStandardLogging()
+        assert root.level == previous
+
+    def test_logger_minimum_level_still_applies(self, make_logger):
+        logger, lines = make_logger(level="error")
+        logger.captureStandardLogging(cmdline=False)
+        logging.getLogger("lib.filtered").warning("dropped")
+        assert lines() == []
+
+    def test_exception_traceback_is_logged(self, make_logger):
+        logger, lines = make_logger()
+        logger.captureStandardLogging(cmdline=False)
+        try:
+            raise ValueError("bad weights")
+        except ValueError:
+            logging.getLogger("lib.model").exception("Loading failed")
+        content = "".join(lines())
+        assert "[ERROR  ] lib.model: Loading failed" in lines()[0]
+        assert "ValueError: bad weights" in content
+
+    def test_non_propagating_logger_can_be_named(self, make_logger):
+        logger, lines = make_logger()
+        library = logging.getLogger("lib.isolated")
+        library.propagate = False
+        try:
+            logger.captureStandardLogging(loggers="lib.isolated", cmdline=False)
+            library.warning("own handler")
+            assert "lib.isolated: own handler" in lines()[0]
+        finally:
+            library.propagate = True
+
+    def test_capturing_again_replaces_the_handler(self, make_logger):
+        logger, lines = make_logger()
+        logger.captureStandardLogging(cmdline=False)
+        logger.captureStandardLogging(cmdline=False)
+        handlers = [h for h in logging.getLogger().handlers if h is Logger._standard_handler]
+        assert len(handlers) == 1
+        logging.getLogger("lib.once").warning("once")
+        assert len(lines()) == 1
+
+    def test_release_and_reset_remove_the_handler(self, make_logger):
+        logger, lines = make_logger()
+        handler = logger.captureStandardLogging(cmdline=False)
+        Logger.releaseStandardLogging()
+        assert handler not in logging.getLogger().handlers
+        logger.captureStandardLogging(cmdline=False)
+        handler = Logger._standard_handler
+        Logger.reset()
+        assert handler not in logging.getLogger().handlers
+
+    def test_console_output(self, make_logger, capsys):
+        logger, _ = make_logger()
+        logger.captureStandardLogging()
+        logging.getLogger("lib.console").warning("visible")
+        captured = capsys.readouterr()
+        assert "lib.console: visible" in captured.out
+        # Not also printed by the standard logging module's fallback.
+        assert "visible" not in captured.err
+
+    def test_unknown_level_raises(self, make_logger):
+        logger, _ = make_logger()
+        with pytest.raises(ValueError):
+            logger.captureStandardLogging(level="debug")
+
+    def test_failure_is_reported_not_raised(self, make_logger, capsys):
+        """A handler problem goes to stderr instead of breaking the caller."""
+        logger, _ = make_logger()
+        logger.captureStandardLogging(cmdline=False)
+        Logger.config = None
+        try:
+            logging.getLogger("lib.broken").warning("x")
+        finally:
+            Logger.reset()
+        assert "Logging error" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------
