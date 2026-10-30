@@ -67,7 +67,8 @@ class LoggerConfig(BaseModel):
     model_config        = ConfigDict(extra="forbid", validate_assignment=True)
 
     # Directory where the log file will be written (relative or absolute path).
-    # The directory is created automatically on the first log() call.
+    # The directory is created automatically on the first log() call, and
+    # again if it is deleted during the run.
     folder: str         = "./data/logs/"
 
     # Name of the log file to write to within `folder`. May contain the

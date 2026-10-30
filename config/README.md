@@ -17,7 +17,7 @@ to their other settings; `Logger` reads only that section and ignores the rest.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `folder` | string | `"./data/logs/"` | Directory where the log file will be written, relative to the working directory at runtime. Created automatically on the first `log()` call if it does not exist. |
+| `folder` | string | `"./data/logs/"` | Directory where the log file will be written, relative to the working directory at runtime. Created automatically on the first `log()` call if it does not exist, and again if it is deleted during the run. |
 | `file_name` | string | `"output.log"` | Name of the log file to write to within `folder`. May contain `{start}`, the moment the run started, with an optional `strftime` format (e.g. `"run_{start:%Y%m%d_%H%M%S}.log"`) to start a new file per run; other placeholders are rejected when the config is loaded. Write literal braces as `{{` and `}}`. |
 | `header_char` | string | `"="` | Exactly one character, used to build the border and body lines of a header block printed by `printHeader()`. Repeated `header_length` times for the top and bottom border. |
 | `header_length` | integer | `60` | Total width in characters (at least 2) of the header block printed by `printHeader()`. The body line is padded or truncated to this width too. |

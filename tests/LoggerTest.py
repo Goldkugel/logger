@@ -474,6 +474,34 @@ class TestLog:
         logger.log("Created", cmdline=False)
         assert "Created" in read_log_lines(str(log_folder))[0]
 
+    def test_log_recreates_deleted_folder(self, make_logger, tmp_path):
+        """A folder deleted during the run is created again on the next line."""
+        import shutil
+        logger, lines = make_logger(folder=str(tmp_path / "logs"))
+        logger.log("Before", cmdline=False)
+        shutil.rmtree(tmp_path / "logs")
+        logger.log("After", cmdline=False)
+        assert len(lines()) == 1
+        assert "After" in lines()[0]
+
+    def test_log_does_not_check_folder_when_it_exists(self, make_logger, monkeypatch):
+        """os.makedirs is only called when opening the file shows the folder is missing."""
+        logger, lines = make_logger()
+        logger.log("First", cmdline=False)
+        calls = []
+        monkeypatch.setattr(os, "makedirs", lambda *a, **k: calls.append(a))
+        logger.log("Second", cmdline=False)
+        assert calls == []
+        assert len(lines()) == 2
+
+    def test_folder_that_is_a_file_raises(self, make_logger, tmp_path):
+        """A path that cannot be a folder is reported, not silently skipped."""
+        blocker = tmp_path / "blocker"
+        blocker.write_text("")
+        logger, _ = make_logger(folder=str(blocker))
+        with pytest.raises(OSError):
+            logger.log("x", cmdline=False)
+
 
     def test_line_format_matches_documentation(self, make_logger):
         """
@@ -871,8 +899,9 @@ def make_logger(tmp_path):
     lines of its log file.
     """
     def factory(**overrides):
-        logger = Logger(config={"folder": str(tmp_path), **overrides})
-        return logger, lambda: read_log_lines(str(tmp_path), logger.config.file_name)
+        config = {"folder": str(tmp_path), **overrides}
+        logger = Logger(config=config)
+        return logger, lambda: read_log_lines(config["folder"], logger.config.file_name)
     return factory
 
 
