@@ -81,10 +81,10 @@ class LoggerConfig(BaseModel):
     # Must be at least 2 (one header_char on each side of the body).
     header_length: int  = Field(default=60, ge=2)
 
-    # Whether to prefix each log message (after the timestamp) with the
-    # elapsed runtime in whole minutes since the Logger singleton was first
-    # created. Useful for tracking how
-    # long a pipeline step takes.
+    # Whether to prefix each log message (after the timestamp and level)
+    # with the elapsed runtime since the Logger singleton was first created,
+    # displayed as set by `runtime_format`. Useful for tracking how long a
+    # pipeline step takes.
     # Note: config/config.yaml sets this to True; the model default False
     # is only used when the config file does not set it.
     log_runtime: bool   = False

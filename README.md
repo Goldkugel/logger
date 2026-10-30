@@ -137,18 +137,18 @@ A log file then looks like this:
 | `error(string, cmdline=True)` | Same as `log(..., level="error")`. | `None` |
 | `exception(string="", exc=None, cmdline=True)` | Logs an error with the traceback of `exc`, or of the exception currently being handled. | `None` |
 | `step(name, cmdline=True)` | Context manager logging the start, end and duration of a block; logs an error and re-raises if the block fails. | context manager |
-| `printHeader(text)` | Logs a bordered header block containing `text`. | `int` — combined length of header lines |
-| `printFileProcessingStart(file)` | Logs the start of processing for `file`. | `int` — message length |
-| `printFileProcessingEnd(file)` | Logs completion of processing for `file`. | `int` — message length |
-| `printDataFrameRowCount(data)` | Logs the row count of a `pandas.DataFrame` (or any object supporting `len()`). | `int` — message length, or `0` if `data` is `None` |
-| `printReadFileStart(file)` | Logs the start of reading `file`. | `int` — message length |
-| `printReadFileEnd(file)` | Logs completion of reading `file`. | `int` — message length |
-| `printWriteFileStart(file)` | Logs the start of writing `file`. | `int` — message length |
-| `printWriteFileEnd(file)` | Logs completion of writing `file`. | `int` — message length |
+| `printHeader(text, cmdline=True)` | Logs a bordered header block containing `text`. | `int` — combined length of header lines |
+| `printFileProcessingStart(file, cmdline=True)` | Logs the start of processing for `file`. | `int` — message length |
+| `printFileProcessingEnd(file, cmdline=True)` | Logs completion of processing for `file`. | `int` — message length |
+| `printDataFrameRowCount(data, cmdline=True)` | Logs the row count of a `pandas.DataFrame` (or any object supporting `len()`). | `int` — message length, or `0` if `data` is `None` |
+| `printReadFileStart(file, cmdline=True)` | Logs the start of reading `file`. | `int` — message length |
+| `printReadFileEnd(file, cmdline=True)` | Logs completion of reading `file`. | `int` — message length |
+| `printWriteFileStart(file, cmdline=True)` | Logs the start of writing `file`. | `int` — message length |
+| `printWriteFileEnd(file, cmdline=True)` | Logs completion of writing `file`. | `int` — message length |
 
 ## Notes & Potential Gotchas
 
-- **Config loading**: the configuration is loaded on the first `Logger()` call, or whenever a config is passed explicitly. A bare `Logger()` call after that keeps the current configuration; `Logger(config=...)` reloads it and replaces the configuration for all references to the singleton.
+- **Config loading**: the configuration is loaded on the first `Logger()` call, or whenever a config is passed explicitly. A bare `Logger()` call after that keeps the current configuration; `Logger(config=...)` reloads it and replaces the configuration for all references to the singleton. A YAML file without a `logger` section (or an empty file) raises a `KeyError`; an empty `logger:` section uses the defaults.
 - **Colors**: only console output is colored, and only when stdout is a terminal and `NO_COLOR` is not set; the log file never contains color codes. In notebooks, output is therefore not colored.
 - **Threads and processes**: logging from several threads is safe. Separate processes (e.g. `multiprocessing` workers) each have their own `Logger` with its own runtime clock; their lines go to the same file in the order they are written, without coordination between the processes.
 - **Log folder**: the folder configured in `folder` is created automatically on the first `log()` call.

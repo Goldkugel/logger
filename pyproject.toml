@@ -4,8 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "logger"
-version = "1.2.0"
+description = "Singleton, YAML-configured logger with log levels, console colors and step timing."
+readme = "README.md"
+version = "1.3.0"
 requires-python = ">=3.8"
+authors = [{ name = "Peter Pallaoro", email = "peter.pallaoro@tum.de" }]
+# The license is given as a classifier instead of the `license` field: the
+# SPDX form of that field needs setuptools>=77, which no longer supports
+# Python 3.8. LICENSE itself is included automatically.
+classifiers = [
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Programming Language :: Python :: 3",
+]
 dependencies = [
     "pydantic>=2",
     "PyYAML",
@@ -13,6 +23,9 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pandas", "pytest", "pytest-cov"]
+
+[project.urls]
+Repository = "https://github.com/Goldkugel/logger"
 
 [tool.setuptools]
 packages = ["logger"]

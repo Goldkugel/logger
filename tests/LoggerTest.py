@@ -280,8 +280,25 @@ class TestConfigLoading:
         bad_config_path = tmp_path / "bad_config.yaml"
         with open(bad_config_path, "w") as f:
             yaml.safe_dump({"not_logger": {}}, f)
-        with pytest.raises(KeyError):
+        with pytest.raises(KeyError, match="no 'logger' section"):
             Logger(config=str(bad_config_path))
+
+    def test_empty_config_file_raises(self, tmp_path):
+        """An empty YAML file has no "logger" section either."""
+        empty_path = tmp_path / "empty.yaml"
+        empty_path.write_text("")
+        with pytest.raises(KeyError, match="no 'logger' section"):
+            Logger(config=str(empty_path))
+
+    def test_empty_logger_section_uses_defaults(self, tmp_path):
+        """
+        "logger:" without keys falls back to the model defaults, as an empty
+        section in a configuration dict does.
+        """
+        config_path = tmp_path / "empty_section.yaml"
+        config_path.write_text("logger:\n")
+        logger = Logger(config=str(config_path))
+        assert logger.config == LoggerConfig()
 
 
 # --------------------------------------------------------------------------
@@ -454,6 +471,12 @@ class TestPrintHeader:
         result        = logger.printHeader("x" * (header_length * 2))
         assert result == 3 * header_length
 
+    def test_cmdline_false_writes_file_only(self, logger_instance, capsys):
+        logger, log_folder = logger_instance
+        logger.printHeader("Quiet", cmdline=False)
+        assert capsys.readouterr().out == ""
+        assert len(read_log_lines(log_folder)) == 3
+
 
 # --------------------------------------------------------------------------
 # File-processing helper methods
@@ -514,6 +537,17 @@ class TestFileProcessingHelpers:
         assert "report.xlsx" in lines[0]
         assert "nested" not in lines[0]
 
+    @pytest.mark.parametrize("method", [
+        "printFileProcessingStart", "printFileProcessingEnd",
+        "printReadFileStart", "printReadFileEnd",
+        "printWriteFileStart", "printWriteFileEnd",
+    ])
+    def test_cmdline_false_writes_file_only(self, logger_instance, capsys, method):
+        logger, log_folder = logger_instance
+        getattr(logger, method)("data.csv", cmdline=False)
+        assert capsys.readouterr().out == ""
+        assert len(read_log_lines(log_folder)) == 1
+
 
 # --------------------------------------------------------------------------
 # printDataFrameRowCount()
@@ -547,6 +581,12 @@ class TestPrintDataFrameRowCount:
         lines = read_log_lines(log_folder)
         assert lines == []
         assert ret == 0
+
+    def test_cmdline_false_writes_file_only(self, logger_instance, capsys):
+        logger, log_folder = logger_instance
+        logger.printDataFrameRowCount(pd.DataFrame({"a": [1]}), cmdline=False)
+        assert capsys.readouterr().out == ""
+        assert "Row count: 1" in read_log_lines(log_folder)[0]
 
 
 # --------------------------------------------------------------------------

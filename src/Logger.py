@@ -171,9 +171,10 @@ class Logger:
         """
         Turn any supported config source into a validated LoggerConfig.
 
-        Missing fields fall back to the model defaults. Raises a KeyError if
-        a YAML file has no "logger" section, and a ValidationError if a value
-        is invalid or an unknown key is present (per the model's
+        Missing fields fall back to the model defaults, also when the
+        "logger" section is empty. Raises a KeyError if a YAML file is empty
+        or has no "logger" section, and a ValidationError if a value is
+        invalid or an unknown key is present (per the model's
         ConfigDict(extra="forbid") setting).
         """
         # Copy a given LoggerConfig so later changes by the caller do not
@@ -193,10 +194,19 @@ class Logger:
 
         # Otherwise it is a path: open and parse the YAML config file and
         # validate its "logger" section.
-        with open(config, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+        path = os.fspath(config)
+        with open(path, "r", encoding="utf-8") as f:
+            # An empty file is parsed as None; treat it like a file without
+            # sections so the KeyError below explains what is missing.
+            data = yaml.safe_load(f) or {}
 
-        return LoggerConfig.model_validate(data[configuration_section])
+        if not isinstance(data, dict) or configuration_section not in data:
+            raise KeyError(
+                f"Config file '{path}' has no '{configuration_section}' section."
+            )
+
+        # An empty section falls back to the defaults, as for a dict.
+        return LoggerConfig.model_validate(data[configuration_section] or {})
 
     @classmethod
     def reset(cls) -> None:
@@ -431,7 +441,7 @@ class Logger:
         duration = self._formatDuration(time.monotonic() - start, precise=True)
         self.log(f"Step '{name}' completed in {duration}.", cmdline)
 
-    def printHeader(self, text: str = "") -> int:
+    def printHeader(self, text: str = "", cmdline: bool = True) -> int:
         """
         Print a formatted header block to the log and console.
 
@@ -447,6 +457,8 @@ class Logger:
         ----------
         text : str, optional
             Text to display in the center of the header body.
+        cmdline : bool, optional
+            Whether to also print the header to stdout (default True).
 
         Returns
         -------
@@ -471,15 +483,17 @@ class Logger:
         # Holding the lock keeps the three lines together when several
         # threads log at the same time.
         with Logger._lock:
-            self.log(head_foot)
-            self.log(body)
-            self.log(head_foot)
+            self.log(head_foot, cmdline)
+            self.log(body, cmdline)
+            self.log(head_foot, cmdline)
 
         # Return the combined character length of all three lines logged
         # (always 3 * header_length, since the body is padded/truncated).
         return 2 * len(head_foot) + len(body)
 
-    def _logFileEvent(self, action: str, file: str, completed: bool) -> int:
+    def _logFileEvent(
+        self, action: str, file: str, completed: bool, cmdline: bool = True
+    ) -> int:
         """
         Log "<action> file '<name>'..." or "<action> file '<name>' completed.".
 
@@ -494,10 +508,10 @@ class Logger:
         """
         suffix  = " completed." if completed else "..."
         message = f"{action} file '{os.path.basename(file)}'{suffix}"
-        self.log(message)
+        self.log(message, cmdline)
         return len(message)
 
-    def printFileProcessingStart(self, file: str = "") -> int:
+    def printFileProcessingStart(self, file: str = "", cmdline: bool = True) -> int:
         """
         Log the start of processing for a file.
 
@@ -505,15 +519,17 @@ class Logger:
         ----------
         file : str, optional
             Full or relative path to the file being processed.
+        cmdline : bool, optional
+            Whether to also print the message to stdout (default True).
 
         Returns
         -------
         int
             Length of the logged message string.
         """
-        return self._logFileEvent("Processing", file, completed=False)
+        return self._logFileEvent("Processing", file, completed=False, cmdline=cmdline)
 
-    def printFileProcessingEnd(self, file: str = "") -> int:
+    def printFileProcessingEnd(self, file: str = "", cmdline: bool = True) -> int:
         """
         Log the completion of processing for a file.
 
@@ -521,15 +537,19 @@ class Logger:
         ----------
         file : str, optional
             Full or relative path to the file that was processed.
+        cmdline : bool, optional
+            Whether to also print the message to stdout (default True).
 
         Returns
         -------
         int
             Length of the logged message string.
         """
-        return self._logFileEvent("Processing", file, completed=True)
+        return self._logFileEvent("Processing", file, completed=True, cmdline=cmdline)
 
-    def printDataFrameRowCount(self, data: pd.DataFrame | None = None) -> int:
+    def printDataFrameRowCount(
+        self, data: pd.DataFrame | None = None, cmdline: bool = True
+    ) -> int:
         """
         Log the number of rows in a DataFrame.
 
@@ -540,6 +560,8 @@ class Logger:
         data : pd.DataFrame or None, optional
             The DataFrame whose row count to log. Any object supporting
             len() works, since only len(data) is used.
+        cmdline : bool, optional
+            Whether to also print the message to stdout (default True).
 
         Returns
         -------
@@ -551,12 +573,12 @@ class Logger:
 
         if data is not None:
             message = f"Row count: {len(data)}"
-            self.log(message)
+            self.log(message, cmdline)
             ret = len(message)
 
         return ret
 
-    def printReadFileStart(self, file: str = "") -> int:
+    def printReadFileStart(self, file: str = "", cmdline: bool = True) -> int:
         """
         Log the start of reading a file.
 
@@ -564,15 +586,17 @@ class Logger:
         ----------
         file : str, optional
             Full or relative path to the file being read.
+        cmdline : bool, optional
+            Whether to also print the message to stdout (default True).
 
         Returns
         -------
         int
             Length of the logged message string.
         """
-        return self._logFileEvent("Reading", file, completed=False)
+        return self._logFileEvent("Reading", file, completed=False, cmdline=cmdline)
 
-    def printWriteFileStart(self, file: str = "") -> int:
+    def printWriteFileStart(self, file: str = "", cmdline: bool = True) -> int:
         """
         Log the start of writing a file.
 
@@ -580,15 +604,17 @@ class Logger:
         ----------
         file : str, optional
             Full or relative path to the file being written.
+        cmdline : bool, optional
+            Whether to also print the message to stdout (default True).
 
         Returns
         -------
         int
             Length of the logged message string.
         """
-        return self._logFileEvent("Writing", file, completed=False)
+        return self._logFileEvent("Writing", file, completed=False, cmdline=cmdline)
 
-    def printReadFileEnd(self, file: str = "") -> int:
+    def printReadFileEnd(self, file: str = "", cmdline: bool = True) -> int:
         """
         Log the completion of reading a file.
 
@@ -596,15 +622,17 @@ class Logger:
         ----------
         file : str, optional
             Full or relative path to the file that was read.
+        cmdline : bool, optional
+            Whether to also print the message to stdout (default True).
 
         Returns
         -------
         int
             Length of the logged message string.
         """
-        return self._logFileEvent("Reading", file, completed=True)
+        return self._logFileEvent("Reading", file, completed=True, cmdline=cmdline)
 
-    def printWriteFileEnd(self, file: str = "") -> int:
+    def printWriteFileEnd(self, file: str = "", cmdline: bool = True) -> int:
         """
         Log the completion of writing a file.
 
@@ -612,10 +640,12 @@ class Logger:
         ----------
         file : str, optional
             Full or relative path to the file that was written.
+        cmdline : bool, optional
+            Whether to also print the message to stdout (default True).
 
         Returns
         -------
         int
             Length of the logged message string.
         """
-        return self._logFileEvent("Writing", file, completed=True)
+        return self._logFileEvent("Writing", file, completed=True, cmdline=cmdline)
