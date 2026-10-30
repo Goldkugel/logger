@@ -18,7 +18,7 @@ to their other settings; `Logger` reads only that section and ignores the rest.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `folder` | string | `"./data/logs/"` | Directory where the log file will be written, relative to the working directory at runtime. Created automatically on the first `log()` call if it does not exist. |
-| `file_name` | string | `"output.log"` | Name of the log file to write to within `folder`. |
+| `file_name` | string | `"output.log"` | Name of the log file to write to within `folder`. May contain `{start}`, the moment the run started, with an optional `strftime` format (e.g. `"run_{start:%Y%m%d_%H%M%S}.log"`) to start a new file per run; other placeholders are rejected when the config is loaded. Write literal braces as `{{` and `}}`. |
 | `header_char` | string | `"="` | Exactly one character, used to build the border and body lines of a header block printed by `printHeader()`. Repeated `header_length` times for the top and bottom border. |
 | `header_length` | integer | `60` | Total width in characters (at least 2) of the header block printed by `printHeader()`. The body line is padded or truncated to this width too. |
 | `log_runtime` | boolean | `false` | If `true`, each log message contains the elapsed time since the Logger singleton was first created, displayed as set by `runtime_format`. Useful for tracking how long individual pipeline steps take. |
@@ -26,6 +26,7 @@ to their other settings; `Logger` reads only that section and ignores the rest.
 | `encoding` | string | `"utf-8"` | Text encoding used when writing the log file. Must be an encoding known to Python (e.g. `"utf-8"`, `"latin-1"`); unknown values are rejected when the config is loaded. |
 | `level` | string | `"info"` | Minimum level a message must have to be logged: `"info"` logs everything, `"warning"` only warnings and errors, `"error"` only errors. Messages below this level are written neither to the file nor to the console. |
 | `runtime_format` | string | `"minutes"` | How the elapsed runtime is displayed when `log_runtime` is enabled: `"minutes"` as `(3 Minutes)` (or `(1 Minute)`), `"hms"` as `(00:03:12)`. |
+| `console` | boolean | `true` | Whether log messages are also printed to stdout. `false` keeps all output in the log file, whatever `cmdline` the individual calls pass. |
 | `colors` | mapping | `info: "white"`, `warning: "yellow"`, `error: "red"` | Console color per level. Allowed colors: `none`, `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`; `none` prints without color. Only the levels `info`, `warning` and `error` are allowed as keys. |
 
 ---
@@ -43,6 +44,7 @@ logger:
   encoding: "utf-8"
   level: "info"
   runtime_format: "minutes"
+  console: true
   colors:
     info: "white"
     warning: "yellow"
@@ -89,6 +91,14 @@ logger:
 
 - **`encoding`** — set explicitly so the log output does not depend on the
   system locale; UTF-8 handles any non-ASCII text in log messages.
+
+- **`file_name` with `{start}`** — `{start}` is the moment the Logger
+  singleton was first created, so all lines of a run go to one file, also
+  if the configuration is reloaded during the run. Without `{start}`, every
+  run appends to the same file.
+
+- **`console`** — set it to `false` for batch jobs whose stdout is saved to
+  a file anyway, so that every line is not stored twice.
 
 - **`format`** — adjust the timestamp format to suit your needs, for example
   `"%H:%M:%S"` for time-only, or `"%Y-%m-%dT%H:%M:%S"` for ISO 8601.

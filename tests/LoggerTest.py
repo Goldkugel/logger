@@ -21,6 +21,7 @@ Tests cover:
 - Multiprocessing (fork and spawn workers, fork while another thread logs)
 - LoggerConfig defaults, validated assignments and package exports
 - Console problems (unencodable characters, broken pipe)
+- console setting and the {start} placeholder in file_name (one file per run)
 
 Run from the repository root with:
     pytest -v
@@ -41,6 +42,7 @@ import sys
 import threading
 import time
 
+from datetime import datetime
 from types import MappingProxyType, SimpleNamespace
 
 import pandas   as pd
@@ -260,6 +262,7 @@ class TestConfigLoading:
         assert logger.config.encoding      == expected["encoding"]
         assert logger.config.level          == expected["level"]
         assert logger.config.runtime_format == expected["runtime_format"]
+        assert logger.config.console        == expected["console"]
         assert logger.config.colors         == LevelColors(**expected["colors"])
 
     @pytest.mark.parametrize("override", [
@@ -273,6 +276,12 @@ class TestConfigLoading:
         {"colors"       : {"warn": "yellow"}},
         {"format"       : "%Y-%m-%d %"},
         {"format"       : "%H:%M %%%"},
+        {"file_name"    : "run_{run}.log"},
+        {"file_name"    : "run_{0}.log"},
+        {"file_name"    : "run_{start.nope}.log"},
+        {"file_name"    : "run_{start.log"},
+        {"file_name"    : ""},
+        {"console"      : "sometimes"},
     ])
     def test_invalid_values_raise(self, tmp_path, override):
         """Invalid values and unknown keys are rejected when the config is loaded."""
@@ -1222,6 +1231,100 @@ class TestThreadSafety:
 
 
 # --------------------------------------------------------------------------
+# console setting
+# --------------------------------------------------------------------------
+
+class TestConsoleSetting:
+    """Tests for console: false, which keeps all output in the log file."""
+
+    def test_console_false_prints_nothing(self, make_logger, capsys):
+        logger, lines = make_logger(console=False, header_length=10)
+        logger.log("a")
+        logger.warning("b")
+        logger.printHeader("c")
+        logger.printReadFileStart("d.csv")
+        with logger.step("e"):
+            pass
+        try:
+            raise ValueError("f")
+        except ValueError:
+            logger.exception("g")
+        assert capsys.readouterr().out == ""
+        # Two messages, three header lines, one file event, two step lines
+        # and one exception() entry (its traceback lines have no prefix).
+        entries = [line for line in lines() if line.startswith("[")]
+        assert len(entries) == 2 + 3 + 1 + 2 + 1
+
+    def test_console_true_still_respects_cmdline(self, make_logger, capsys):
+        logger, _ = make_logger(console=True)
+        logger.log("quiet", cmdline=False)
+        logger.log("loud")
+        out = capsys.readouterr().out
+        assert "quiet" not in out
+        assert "loud" in out
+
+    def test_console_can_be_switched_at_runtime(self, make_logger, capsys):
+        logger, lines = make_logger()
+        logger.config.console = False
+        logger.log("file only")
+        assert capsys.readouterr().out == ""
+        assert "file only" in lines()[0]
+
+
+# --------------------------------------------------------------------------
+# {start} placeholder in file_name
+# --------------------------------------------------------------------------
+
+class TestFileNamePlaceholder:
+    """Tests for a new log file per run via {start} in file_name."""
+
+    def test_start_placeholder_names_file_after_run_start(self, tmp_path):
+        logger = Logger(config={
+            "folder"   : str(tmp_path),
+            "file_name": "run_{start:%Y%m%d_%H%M%S}.log",
+        })
+        Logger.start_datetime = datetime(2026, 10, 30, 9, 5, 7)
+        logger.log("x", cmdline=False)
+        expected = tmp_path / "run_20261030_090507.log"
+        assert logger.logFilePath() == str(expected)
+        assert "x" in expected.read_text()
+
+    def test_all_lines_of_a_run_go_to_one_file(self, tmp_path):
+        """The name is fixed at the start of the run, also across reconfiguration."""
+        config = {"folder": str(tmp_path), "file_name": "run_{start:%Y%m%d_%H%M%S_%f}.log"}
+        logger = Logger(config=config)
+        logger.log("first", cmdline=False)
+        time.sleep(0.01)
+        Logger(config=dict(config, level="info"))
+        logger.log("second", cmdline=False)
+        files = list(tmp_path.iterdir())
+        assert len(files) == 1
+        assert len(files[0].read_text().splitlines()) == 2
+
+    def test_reset_starts_a_new_file(self, tmp_path):
+        config = {"folder": str(tmp_path), "file_name": "run_{start:%H%M%S_%f}.log"}
+        Logger(config=config).log("first", cmdline=False)
+        time.sleep(0.01)
+        Logger.reset()
+        Logger(config=config).log("second", cmdline=False)
+        assert len(list(tmp_path.iterdir())) == 2
+
+    def test_name_without_placeholder_is_used_as_is(self, make_logger):
+        logger, _ = make_logger(file_name="output.log")
+        assert logger.logFilePath() == os.path.join(logger.config.folder, "output.log")
+
+    def test_doubled_braces_are_literal(self, make_logger):
+        logger, _ = make_logger(file_name="run_{{1}}.log")
+        logger.log("x", cmdline=False)
+        assert os.path.basename(logger.logFilePath()) == "run_{1}.log"
+        assert os.path.exists(logger.logFilePath())
+
+    def test_log_file_path_without_config_raises(self):
+        with pytest.raises(RuntimeError, match="no configuration"):
+            Logger.__new__(Logger).logFilePath()
+
+
+# --------------------------------------------------------------------------
 # Multiprocessing
 # --------------------------------------------------------------------------
 
@@ -1327,6 +1430,7 @@ class TestLoggerConfig:
         assert config.encoding       == "utf-8"
         assert config.level          == "info"
         assert config.runtime_format == "minutes"
+        assert config.console        is True
         assert config.colors         == LevelColors(info="white", warning="yellow", error="red")
 
     def test_unknown_key_rejected(self):

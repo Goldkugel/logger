@@ -95,6 +95,10 @@ class Logger:
         Monotonic clock value (time.monotonic()) recorded when the singleton
         is first created. Used to compute elapsed runtime in log messages;
         unaffected by system clock changes.
+    start_datetime : datetime or None
+        Wall-clock time recorded together with start_time. Fills the
+        {start} placeholder in `file_name`, so that all lines of a run go
+        to the same file.
     _instance : Logger or None
         The single shared instance, managed by __new__.
     _lock : threading.RLock
@@ -113,6 +117,7 @@ class Logger:
     # instance.
     config    : LoggerConfig | None = None
     start_time: float               = 0.0
+    start_datetime: dt | None       = None
     _instance : Logger | None       = None
 
     # Re-entrant, because printHeader() holds the lock while calling log()
@@ -134,8 +139,9 @@ class Logger:
         with cls._lock:
             if cls._instance is None:
                 # No instance exists yet: create it and start the runtime clock.
-                cls._instance  = super().__new__(cls)
-                cls.start_time = time.monotonic()
+                cls._instance       = super().__new__(cls)
+                cls.start_time      = time.monotonic()
+                cls.start_datetime  = dt.now()
 
         # On subsequent calls, return the existing instance instead of a new one.
         return cls._instance
@@ -257,6 +263,7 @@ class Logger:
             cls._instance       = None
             cls.config          = None
             cls.start_time      = 0.0
+            cls.start_datetime  = None
             cls._console_closed = False
 
     @staticmethod
@@ -340,6 +347,28 @@ class Logger:
             )
         return config
 
+    def _logFilePath(self, config: LoggerConfig) -> str:
+        """
+        Path of the log file for `config`, with the {start} placeholder in
+        `file_name` filled in with the start of the run.
+        """
+        file_name = config.file_name.format(start=Logger.start_datetime or dt.now())
+        return os.path.join(config.folder, file_name)
+
+    def logFilePath(self) -> str:
+        """
+        Return the path of the file log messages are written to.
+
+        Useful when `file_name` contains the {start} placeholder, e.g. to
+        attach the log file of a run to its results.
+
+        Raises
+        ------
+        RuntimeError
+            If no configuration is loaded (see _currentConfig()).
+        """
+        return self._logFilePath(self._currentConfig())
+
     def _printToConsole(self, message: str) -> bool:
         """
         Print `message` to stdout without letting the console break logging.
@@ -378,7 +407,8 @@ class Logger:
             [<timestamp>] [<LEVEL>] (<runtime>) <message>
         where the runtime part is only present if `log_runtime` is enabled.
         Messages below the configured minimum `level` are dropped. The line
-        is written to the file first, then shown on the console in the
+        is written to the file first, then (if `cmdline` and the `console`
+        setting allow it) shown on the console in the
         color configured for its level. Problems with the console (closed
         pipe, characters it cannot encode) never stop the line from being
         written to the file; a closed console is reported once as a warning
@@ -395,6 +425,7 @@ class Logger:
             The message to log. None is silently ignored.
         cmdline : bool, optional
             Whether to also print the message to stdout (default True).
+            Has no effect if the `console` setting is false.
         level : str, optional
             "info" (default), "warning" or "error".
 
@@ -423,7 +454,7 @@ class Logger:
             return
 
         # Build the full path to the log file from the config.
-        path = os.path.join(config.folder, config.file_name)
+        path = self._logFilePath(config)
 
         # Start the log line with a timestamp, formatted per config, and the
         # level tag padded to a fixed width.
@@ -453,10 +484,12 @@ class Logger:
             with open(path, mode="a", encoding=config.encoding) as log_file:
                 log_file.write(message + "\n")
 
-            # Mirror the message to the console if requested; only the
-            # console output is colored. If the console has just closed,
-            # say so in the log file (the lock is re-entrant).
-            if cmdline and self._printToConsole(self._colorize(message, level, config)):
+            # Mirror the message to the console if requested by the call and
+            # allowed by the `console` setting; only the console output is
+            # colored. If the console has just closed, say so in the log
+            # file (the lock is re-entrant).
+            show = cmdline and config.console
+            if show and self._printToConsole(self._colorize(message, level, config)):
                 self.log(console_closed_message, cmdline=False, level="warning")
 
     def info(self, string: str = "", cmdline: bool = True) -> None:

@@ -70,7 +70,10 @@ class LoggerConfig(BaseModel):
     # The directory is created automatically on the first log() call.
     folder: str         = "./data/logs/"
 
-    # Name of the log file to write to within `folder`.
+    # Name of the log file to write to within `folder`. May contain the
+    # placeholder {start}, the moment the Logger singleton was first created,
+    # with an optional strftime format, e.g. "run_{start:%Y%m%d_%H%M%S}.log",
+    # to start a new log file per run. Checked by check_file_name below.
     file_name: str      = "output.log"
 
     # Character used to build the header/footer separator line printed by
@@ -111,6 +114,11 @@ class LoggerConfig(BaseModel):
     # "minutes" -> "(3 Minutes)", "hms" -> "(00:03:12)".
     runtime_format: RuntimeFormat = "minutes"
 
+    # Whether log messages are also printed to stdout. False keeps all
+    # output in the log file, whatever `cmdline` the individual calls pass;
+    # useful for batch jobs whose stdout is saved anyway.
+    console: bool       = True
+
     # Console color per log level (see LevelColors). Colors are only used
     # when stdout is a terminal and the NO_COLOR environment variable is not
     # set, so redirected output and log files never contain color codes.
@@ -129,6 +137,26 @@ class LoggerConfig(BaseModel):
             codecs.lookup(value)
         except LookupError as e:
             raise ValueError(f"Unknown encoding '{value}'") from e
+        return value
+
+    @field_validator("file_name")
+    @classmethod
+    def check_file_name(cls, value: str) -> str:
+        """
+        Reject file names with placeholders other than {start}, so that a
+        typo is caught when the config is loaded instead of on the first
+        log() call. Literal braces are written as {{ and }}.
+        """
+        try:
+            name = value.format(start=datetime.now())
+        except (KeyError, IndexError, ValueError, AttributeError) as e:
+            raise ValueError(
+                f"Invalid file_name '{value}': only the placeholder {{start}} is "
+                f"supported, optionally with a strftime format such as "
+                f"{{start:%Y%m%d_%H%M%S}} ({type(e).__name__}: {e})"
+            ) from e
+        if not name:
+            raise ValueError("file_name must not be empty")
         return value
 
     @field_validator("format")

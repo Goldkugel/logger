@@ -6,7 +6,8 @@ A lightweight, singleton-based logging utility for Python projects that writes t
 
 - **Singleton pattern** — only one `Logger` instance exists per process, and it tracks the time since the instance was first created (`start_time`).
 - **YAML-based configuration** — reads settings such as log folder, file name, header formatting, and timestamp format from a config file.
-- **Console + file logging** — every message is written to the log file, with optional mirroring to stdout.
+- **Console + file logging** — every message is written to the log file, with optional mirroring to stdout (per call, or switched off entirely with `console: false`).
+- **One log file per run (optional)** — `file_name: "run_{start:%Y%m%d_%H%M%S}.log"` starts a new file for every run instead of appending to one file.
 - **Log levels with colors** — `info`, `warning` and `error` messages, a configurable minimum level, and a configurable console color per level (white, yellow and red by default).
 - **Optional runtime tracking** — add the elapsed time since the logger started to each log entry, in minutes or as `HH:MM:SS`.
 - **Step timing** — `with logger.step("..."):` logs the start, end and exact duration of a block.
@@ -42,6 +43,7 @@ logger:
   encoding: "utf-8"
   level: "info"
   runtime_format: "minutes"
+  console: True
   colors:
     info: "white"
     warning: "yellow"
@@ -145,6 +147,7 @@ A log file then looks like this:
 | `printReadFileEnd(file, cmdline=True)` | Logs completion of reading `file`. | `int` — message length |
 | `printWriteFileStart(file, cmdline=True)` | Logs the start of writing `file`. | `int` — message length |
 | `printWriteFileEnd(file, cmdline=True)` | Logs completion of writing `file`. | `int` — message length |
+| `logFilePath()` | Path of the current log file, with `{start}` in `file_name` filled in. | `str` |
 
 ## Notes & Potential Gotchas
 
@@ -153,6 +156,8 @@ A log file then looks like this:
 - **Threads and processes**: logging from several threads is safe. `multiprocessing` workers depend on the start method: with `fork` (the Linux default before Python 3.14) a worker inherits the parent's configuration and runtime clock, and gets a fresh lock, so it does not hang if another thread was logging at the moment of the fork; with `spawn` or `forkserver` (the default on macOS and Windows, and on Linux from Python 3.14) it starts without a `Logger`, so a bare `Logger()` loads `./config/config.yaml` and starts a new runtime clock — pass the configuration to the worker if it differs. Lines from several processes go to the same file in the order they are written, without coordination between the processes.
 - **Console problems**: each line is written to the log file before it is printed, so console problems never lose it. Characters the console cannot encode are replaced on the console only (e.g. by `?`). If the console stops accepting output, e.g. because the output was piped into `head`, console output is switched off for the rest of the run and a warning is written to the log file; Python may still report the closed pipe on stderr when the program exits.
 - **Log folder**: the folder configured in `folder` is created automatically on the first `log()` call.
+- **One file per run**: `{start}` in `file_name` is the moment the `Logger` singleton was first created, so all lines of a run go to the same file, also when the configuration is reloaded. `Logger.reset()` starts a new file. Two runs started within the same second share a file unless the format includes `%f` (microseconds). `multiprocessing` workers started with `spawn` or `forkserver` create their own `Logger` and therefore their own file. Use `Logger().logFilePath()` to find the file of the current run.
+- **Console output**: `console: false` keeps all messages in the log file only, whatever `cmdline` the calls pass, e.g. for batch jobs whose stdout is saved anyway.
 - **Encoding**: the log file is written with the configured `encoding` (default UTF-8), independent of the system locale.
 - **Message format**: the messages the logger writes itself are one sentence each, e.g. `Step 'Load' started.`, `Reading file 'hp.obo' completed.` or `Row count: 3.` A step failure gives the error on the same line (`(ValueError: bad row)`); only `exception()` adds the traceback on the following lines.
 - **Header width**: `printHeader` centers `text` within `header_length - 2` characters; longer text is truncated so the header always has the configured width.
