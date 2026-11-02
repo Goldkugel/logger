@@ -26,7 +26,7 @@ to their other settings; `Logger` reads only that section and ignores the rest.
 | `encoding` | string | `"utf-8"` | Text encoding used when writing the log file. Must be an encoding known to Python (e.g. `"utf-8"`, `"latin-1"`); unknown values are rejected when the config is loaded. |
 | `level` | string | `"info"` | Minimum level a message must have to be logged: `"info"` logs everything, `"warning"` only warnings and errors, `"error"` only errors. Messages below this level are written neither to the file nor to the console. |
 | `runtime_format` | string | `"minutes"` | How the elapsed runtime is displayed when `log_runtime` is enabled: `"minutes"` as `(3 Minutes)` (or `(1 Minute)`), `"hms"` as `(00:03:12)`. |
-| `console` | boolean | `true` | Whether log messages are also printed to stdout. `false` keeps all output in the log file, whatever `cmdline` the individual calls pass. |
+| `console` | boolean | `true` | Whether log messages are also printed to the console (info to stdout, warnings and errors to stderr). `false` keeps all output in the log file, whatever `cmdline` the individual calls pass. |
 | `colors` | mapping | `info: "white"`, `warning: "yellow"`, `error: "red"` | Console color per level. Allowed colors: `none`, `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`; `none` prints without color. Only the levels `info`, `warning` and `error` are allowed as keys. |
 
 ---
@@ -84,8 +84,9 @@ logger:
   only keep warnings and errors, e.g. for long batch runs.
 
 - **`colors`** — colors are only applied to console output, never to the log
-  file. They are also left out when the output is redirected to a file or
-  pipe (for example `python run.py > out.txt`, or a batch job's output file)
+  file. They are also left out when the stream a line goes to (stdout for
+  info, stderr for warnings and errors) is redirected to a file or pipe (for
+  example `python run.py > out.txt`, or a batch job's output file)
   and when the [`NO_COLOR`](https://no-color.org) environment variable is set
   to a non-empty value.
 
@@ -97,8 +98,12 @@ logger:
   if the configuration is reloaded during the run. Without `{start}`, every
   run appends to the same file.
 
-- **`console`** — set it to `false` for batch jobs whose stdout is saved to
-  a file anyway, so that every line is not stored twice.
+- **`console`** — set it to `false` for batch jobs whose console output is
+  saved to a file anyway, so that every line is not stored twice.
 
 - **`format`** — adjust the timestamp format to suit your needs, for example
   `"%H:%M:%S"` for time-only, or `"%Y-%m-%dT%H:%M:%S"` for ISO 8601.
+  Timestamps are in the local time of the machine and carry no time zone by
+  default. When logs from several machines (e.g. HPC nodes) or around a
+  daylight-saving change are compared, add `%z` for the UTC offset, e.g.
+  `"%Y-%m-%d %H:%M:%S %z"` gives `2026-11-02 10:32:01 +0100`.

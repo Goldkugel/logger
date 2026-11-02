@@ -4,16 +4,17 @@ normalizer, embedder, model, ...).
 
 Provides the Logger class, which reads its configuration from a YAML file
 (or a mapping or LoggerConfig), writes timestamped log messages to a file,
-and optionally mirrors them to stdout. A singleton pattern ensures that only one Logger instance (and one
-loaded config) exists per process, and that the runtime clock starts at the
-moment the very first Logger() call is made.
+and optionally mirrors them to the console. A singleton pattern ensures
+that only one Logger instance (and one loaded config) exists per process,
+and that the runtime clock starts at the moment the very first Logger()
+call is made.
 """
 
 from __future__ import annotations
 
 from contextlib     import contextmanager
 from datetime       import datetime as dt
-from typing         import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Union
+from typing         import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Sized, Union
 from .LoggerConfig  import LoggerConfig
 import yaml
 import logging
@@ -72,12 +73,16 @@ standard_levels: dict[str, int] = {
     "error"  : logging.ERROR,
 }
 
-# Warning logged once when the console stops accepting output, e.g. because
-# the program's output was piped into `head`.
+# Warning logged once per stream when the console stops accepting output,
+# e.g. because the program's output was piped into `head`.
 console_closed_message: str = (
-    "Console output is closed (broken pipe); further messages are only "
-    "written to the log file."
+    "Console output to {stream} is closed (broken pipe); further messages "
+    "for {stream} are only written to the log file."
 )
+
+# Minimum level printed to stderr instead of stdout, following the usual
+# convention that diagnostics go to stderr.
+stderr_level: str = "warning"
 
 
 class Logger:
@@ -86,8 +91,9 @@ class Logger:
 
     Reads its configuration from a YAML file, a dict or a LoggerConfig
     (validated via LoggerConfig) and writes timestamped log messages to a
-    file, optionally mirroring them to stdout. Because it's a singleton, only one instance (and one
-    loaded config) exists per process, and `start_time` is fixed at the
+    file, optionally mirroring them to the console (stdout, or stderr for
+    warnings and errors). Because it's a singleton, only one instance (and
+    one loaded config) exists per process, and `start_time` is fixed at the
     moment the first instance is created.
 
     All public methods are thread-safe: lines written by different threads
@@ -113,9 +119,10 @@ class Logger:
     _lock : threading.RLock
         Lock guarding singleton creation, configuration loading and writing.
         Replaced by a fresh lock in forked child processes.
-    _console_closed : bool
-        Set once stdout has stopped accepting output (broken pipe); console
-        output is skipped from then on.
+    _closed_streams : set of str
+        Names of the console streams ("stdout", "stderr") that have stopped
+        accepting output (broken pipe); output to them is skipped from then
+        on.
     _standard_handler, _standard_targets
         The handler installed by captureStandardLogging() and the standard
         loggers it was added to; removed again by releaseStandardLogging().
@@ -137,7 +144,7 @@ class Logger:
     # needs no lock: it logs message and traceback as one entry.)
     _lock     : threading.RLock     = threading.RLock()
 
-    _console_closed: bool           = False
+    _closed_streams: set[str]       = set()
 
     # Handler installed by captureStandardLogging(), and the standard
     # loggers it was added to, each with the level it had before.
@@ -331,7 +338,7 @@ class Logger:
             cls.config          = None
             cls.start_time      = 0.0
             cls.start_datetime  = None
-            cls._console_closed = False
+            cls._closed_streams = set()
 
     @staticmethod
     def _formatDuration(seconds: float, precise: bool = False) -> str:
@@ -370,24 +377,26 @@ class Logger:
         return f"{minutes} {'Minute' if minutes == 1 else 'Minutes'}"
 
     @staticmethod
-    def _useColors() -> bool:
+    def _useColors(stream: Any = None) -> bool:
         """
-        Whether console output may contain color codes.
+        Whether console output to `stream` (default stdout) may contain
+        color codes.
 
-        Only true if stdout is a terminal (not redirected to a file or pipe)
-        and the NO_COLOR environment variable (https://no-color.org) is not
-        set to a non-empty value; as the convention says, an empty NO_COLOR
-        is ignored. Some stdout replacements (e.g. in notebooks) lack
-        isatty(), which is treated as "not a terminal".
+        Only true if the stream is a terminal (not redirected to a file or
+        pipe) and the NO_COLOR environment variable (https://no-color.org)
+        is not set to a non-empty value; as the convention says, an empty
+        NO_COLOR is ignored. Some stream replacements (e.g. in notebooks)
+        lack isatty(), which is treated as "not a terminal".
         """
-        isatty = getattr(sys.stdout, "isatty", None)
+        stream = sys.stdout if stream is None else stream
+        isatty = getattr(stream, "isatty", None)
         return bool(isatty and isatty()) and not os.environ.get("NO_COLOR")
 
-    def _colorize(self, message: str, level: str, config: LoggerConfig) -> str:
-        """Wrap `message` in the color configured for `level`, if enabled."""
+    def _colorize(self, message: str, level: str, config: LoggerConfig, stream: Any = None) -> str:
+        """Wrap `message` in the color configured for `level`, if enabled for `stream`."""
         color = ansi_colors[getattr(config.colors, level)]
 
-        if not color or not self._useColors():
+        if not color or not self._useColors(stream):
             return message
 
         return f"{color}{message}{ansi_reset}"
@@ -436,35 +445,61 @@ class Logger:
         """
         return self._logFilePath(self._currentConfig())
 
-    def _printToConsole(self, message: str) -> bool:
+    @staticmethod
+    def _consoleStream(level: str) -> str:
         """
-        Print `message` to stdout without letting the console break logging.
+        Name of the console stream for `level`: "stderr" for warnings and
+        errors, "stdout" for everything else.
+        """
+        return "stderr" if levels[level] >= levels[stderr_level] else "stdout"
 
-        Characters the console cannot encode are replaced (e.g. by "?"),
-        since the log file already has the full text. If stdout is closed
-        (broken pipe, e.g. when piped into `head`), console output is
-        switched off for the rest of the run.
+    def _printToConsole(self, message: str, level: str, config: LoggerConfig) -> list[str]:
+        """
+        Print `message` to the console stream for `level` without letting
+        the console break logging.
+
+        Warnings and errors go to stderr, everything else to stdout (see
+        _consoleStream()). Before writing to stderr, stdout is flushed, so
+        that lines keep their order when both streams go to the same file
+        (e.g. `python run.py > out.txt 2>&1`, where stdout is buffered but
+        stderr is not). Characters the console cannot encode are replaced
+        (e.g. by "?"), since the log file already has the full text. A
+        stream that is closed (broken pipe, e.g. when piped into `head`) is
+        skipped for the rest of the run.
 
         Returns
         -------
-        bool
-            True if stdout has just turned out to be closed, so that the
-            caller can log a warning about it.
+        list of str
+            Names of the streams that have just turned out to be closed, so
+            that the caller can log a warning about each.
         """
-        if Logger._console_closed:
-            return False
+        name   = self._consoleStream(level)
+        closed = []
 
+        if name == "stderr" and "stdout" not in Logger._closed_streams:
+            try:
+                if sys.stdout is not None:
+                    sys.stdout.flush()
+            except BrokenPipeError:
+                Logger._closed_streams.add("stdout")
+                closed.append("stdout")
+
+        stream = getattr(sys, name)
+        if stream is None or name in Logger._closed_streams:
+            return closed
+
+        message = self._colorize(message, level, config, stream)
         try:
             try:
-                print(message)
+                print(message, file=stream)
             except UnicodeEncodeError:
-                encoding = getattr(sys.stdout, "encoding", None) or "ascii"
-                print(message.encode(encoding, "replace").decode(encoding))
+                encoding = getattr(stream, "encoding", None) or "ascii"
+                print(message.encode(encoding, "replace").decode(encoding), file=stream)
         except BrokenPipeError:
-            Logger._console_closed = True
-            return True
+            Logger._closed_streams.add(name)
+            closed.append(name)
 
-        return False
+        return closed
 
     @staticmethod
     def _appendToFile(path: str, message: str, encoding: str) -> None:
@@ -489,18 +524,18 @@ class Logger:
 
     def log(self, string: str = "", cmdline: bool = True, level: str = "info") -> None:
         """
-        Log a timestamped message to file and optionally to stdout.
+        Log a timestamped message to file and optionally to the console.
 
         Each line has the form
             [<timestamp>] [<LEVEL>] (<runtime>) <message>
         where the runtime part is only present if `log_runtime` is enabled.
         Messages below the configured minimum `level` are dropped. The line
         is written to the file first, then (if `cmdline` and the `console`
-        setting allow it) shown on the console in the
-        color configured for its level. Problems with the console (closed
-        pipe, characters it cannot encode) never stop the line from being
-        written to the file; a closed console is reported once as a warning
-        in the log file.
+        setting allow it) shown on the console in the color configured for
+        its level: on stdout for "info", on stderr for "warning" and
+        "error". Problems with the console (closed pipe, characters it
+        cannot encode) never stop the line from being written to the file;
+        a closed stream is reported once as a warning in the log file.
 
         If `string` is None, the call is silently ignored — this allows
         callers to pass through optional values without extra None checks.
@@ -512,7 +547,7 @@ class Logger:
         string : str, optional
             The message to log. None is silently ignored.
         cmdline : bool, optional
-            Whether to also print the message to stdout (default True).
+            Whether to also print the message to the console (default True).
             Has no effect if the `console` setting is false.
         level : str, optional
             "info" (default), "warning" or "error".
@@ -575,11 +610,13 @@ class Logger:
 
             # Mirror the message to the console if requested by the call and
             # allowed by the `console` setting; only the console output is
-            # colored. If the console has just closed, say so in the log
-            # file (the lock is re-entrant).
-            show = cmdline and config.console
-            if show and self._printToConsole(self._colorize(message, level, config)):
-                self._logWith(config, console_closed_message, False, "warning")
+            # colored. If a console stream has just closed, say so in the
+            # log file (the lock is re-entrant).
+            if cmdline and config.console:
+                for stream in self._printToConsole(message, level, config):
+                    self._logWith(
+                        config, console_closed_message.format(stream=stream), False, "warning"
+                    )
 
     def info(self, string: str = "", cmdline: bool = True) -> None:
         """Log a message with level "info". See log()."""
@@ -630,7 +667,7 @@ class Logger:
             The exception to log. Defaults to the exception currently being
             handled.
         cmdline : bool, optional
-            Whether to also print the message to stdout (default True).
+            Whether to also print the message to the console (default True).
         """
         if exc is None:
             exc = sys.exc_info()[1]
@@ -669,7 +706,7 @@ class Logger:
         name : str
             Name of the step, shown in the log messages.
         cmdline : bool, optional
-            Whether to also print the messages to stdout (default True).
+            Whether to also print the messages to the console (default True).
         """
         self.log(f"Step '{name}' started.", cmdline)
         start = time.monotonic()
@@ -721,10 +758,10 @@ class Logger:
             (e.g. "vllm"), and consider cmdline=False for them, since they
             print to the console themselves.
         cmdline : bool, optional
-            Whether captured records are also printed to stdout (default
-            True). Without other handlers, the standard logging module
-            prints warnings to stderr only until this capture is installed,
-            so they are not shown twice.
+            Whether captured records are also printed to the console
+            (default True). Without other handlers, the standard logging
+            module prints warnings to stderr only until this capture is
+            installed, so they are not shown twice.
 
         Returns
         -------
@@ -780,9 +817,9 @@ class Logger:
             cls._standard_handler = None
             cls._standard_targets = []
 
-    def printHeader(self, text: str = "", cmdline: bool = True) -> int:
+    def printHeader(self, text: str = "", cmdline: bool = True, level: str = "info") -> int:
         """
-        Log a formatted header block, optionally also printing it to stdout.
+        Log a formatted header block, optionally also printing it to the console.
 
         The header consists of three lines:
           1. A top border of `header_char` repeated `header_length` times.
@@ -797,7 +834,10 @@ class Logger:
         text : str, optional
             Text to display in the center of the header body.
         cmdline : bool, optional
-            Whether to also print the header to stdout (default True).
+            Whether to also print the header to the console (default True).
+        level : str, optional
+            Level of the logged line(s): "info" (default), "warning" or
+            "error".
 
         Returns
         -------
@@ -825,173 +865,232 @@ class Logger:
                 f"{config.header_char}"
             )
 
-            self.log(head_foot, cmdline)
-            self.log(body, cmdline)
-            self.log(head_foot, cmdline)
+            self.log(head_foot, cmdline, level)
+            self.log(body, cmdline, level)
+            self.log(head_foot, cmdline, level)
 
         # Return the combined character length of all three lines logged
         # (always 3 * header_length, since the body is padded/truncated).
         return 2 * len(head_foot) + len(body)
 
     def _logFileEvent(
-        self, action: str, file: str, completed: bool, cmdline: bool = True
+        self,
+        action: str,
+        file: str | os.PathLike[str],
+        completed: bool,
+        cmdline: bool = True,
+        level: str = "info",
     ) -> int:
         """
         Log "<action> file '<name>' started." or "<action> file '<name>' completed.",
         matching the wording of step().
 
         Shared implementation of the printFileProcessing*, printReadFile*
-        and printWriteFile* helpers. Only the basename of `file` is logged —
-        the directory path is stripped to keep messages concise.
+        and printWriteFile* helpers. Only the last component of `file` is
+        logged — the directory path is stripped to keep messages concise
+        (a trailing separator is ignored, so "out/" logs "out").
 
         Returns
         -------
         int
             Length of the logged message string.
+
+        Raises
+        ------
+        ValueError
+            If `file` is empty, which would log the name ''.
         """
+        path = os.fspath(file)
+        if not path:
+            raise ValueError("file must not be empty")
+
         event   = "completed" if completed else "started"
-        message = f"{action} file '{os.path.basename(file)}' {event}."
-        self.log(message, cmdline)
+        name    = os.path.basename(os.path.normpath(path))
+        message = f"{action} file '{name}' {event}."
+        self.log(message, cmdline, level)
         return len(message)
 
-    def printFileProcessingStart(self, file: str = "", cmdline: bool = True) -> int:
+    def printFileProcessingStart(
+        self, file: str | os.PathLike[str], cmdline: bool = True, level: str = "info"
+    ) -> int:
         """
         Log the start of processing for a file.
 
         Parameters
         ----------
-        file : str, optional
+        file : str or os.PathLike
             Full or relative path to the file being processed.
         cmdline : bool, optional
-            Whether to also print the message to stdout (default True).
+            Whether to also print the message to the console (default True).
+        level : str, optional
+            Level of the logged line(s): "info" (default), "warning" or
+            "error".
 
         Returns
         -------
         int
             Length of the logged message string.
         """
-        return self._logFileEvent("Processing", file, completed=False, cmdline=cmdline)
+        return self._logFileEvent("Processing", file, completed=False, cmdline=cmdline, level=level)
 
-    def printFileProcessingEnd(self, file: str = "", cmdline: bool = True) -> int:
+    def printFileProcessingEnd(
+        self, file: str | os.PathLike[str], cmdline: bool = True, level: str = "info"
+    ) -> int:
         """
         Log the completion of processing for a file.
 
         Parameters
         ----------
-        file : str, optional
+        file : str or os.PathLike
             Full or relative path to the file that was processed.
         cmdline : bool, optional
-            Whether to also print the message to stdout (default True).
+            Whether to also print the message to the console (default True).
+        level : str, optional
+            Level of the logged line(s): "info" (default), "warning" or
+            "error".
 
         Returns
         -------
         int
             Length of the logged message string.
         """
-        return self._logFileEvent("Processing", file, completed=True, cmdline=cmdline)
+        return self._logFileEvent("Processing", file, completed=True, cmdline=cmdline, level=level)
 
-    def printDataFrameRowCount(
-        self, data: pd.DataFrame | None = None, cmdline: bool = True
+    def printRowCount(
+        self, data: Sized | None = None, cmdline: bool = True, level: str = "info"
     ) -> int:
         """
-        Log the number of rows in a DataFrame.
+        Log the number of rows (items) of `data`: "Row count: 3.".
 
-        If `data` is None, nothing is logged and 0 is returned.
+        Works with anything that supports len(), e.g. a pandas DataFrame,
+        a list or a dict. If `data` is None, nothing is logged and 0 is
+        returned.
 
         Parameters
         ----------
-        data : pd.DataFrame or None, optional
-            The DataFrame whose row count to log. Any object supporting
-            len() works, since only len(data) is used.
+        data : Sized or None, optional
+            The object whose length to log.
         cmdline : bool, optional
-            Whether to also print the message to stdout (default True).
+            Whether to also print the message to the console (default True).
+        level : str, optional
+            Level of the logged line(s): "info" (default), "warning" or
+            "error".
 
         Returns
         -------
         int
-            Length of the logged message string, or 0 if no DataFrame
-            was provided.
+            Length of the logged message string, or 0 if `data` is None.
         """
         ret = 0
 
         if data is not None:
             message = f"Row count: {len(data)}."
-            self.log(message, cmdline)
+            self.log(message, cmdline, level)
             ret = len(message)
 
         return ret
 
-    def printReadFileStart(self, file: str = "", cmdline: bool = True) -> int:
+    def printDataFrameRowCount(
+        self, data: pd.DataFrame | None = None, cmdline: bool = True, level: str = "info"
+    ) -> int:
+        """
+        Log the number of rows in a DataFrame. Same as printRowCount(),
+        which works with any object supporting len(); kept for existing
+        callers.
+        """
+        return self.printRowCount(data, cmdline, level)
+
+    def printReadFileStart(
+        self, file: str | os.PathLike[str], cmdline: bool = True, level: str = "info"
+    ) -> int:
         """
         Log the start of reading a file.
 
         Parameters
         ----------
-        file : str, optional
+        file : str or os.PathLike
             Full or relative path to the file being read.
         cmdline : bool, optional
-            Whether to also print the message to stdout (default True).
+            Whether to also print the message to the console (default True).
+        level : str, optional
+            Level of the logged line(s): "info" (default), "warning" or
+            "error".
 
         Returns
         -------
         int
             Length of the logged message string.
         """
-        return self._logFileEvent("Reading", file, completed=False, cmdline=cmdline)
+        return self._logFileEvent("Reading", file, completed=False, cmdline=cmdline, level=level)
 
-    def printWriteFileStart(self, file: str = "", cmdline: bool = True) -> int:
+    def printWriteFileStart(
+        self, file: str | os.PathLike[str], cmdline: bool = True, level: str = "info"
+    ) -> int:
         """
         Log the start of writing a file.
 
         Parameters
         ----------
-        file : str, optional
+        file : str or os.PathLike
             Full or relative path to the file being written.
         cmdline : bool, optional
-            Whether to also print the message to stdout (default True).
+            Whether to also print the message to the console (default True).
+        level : str, optional
+            Level of the logged line(s): "info" (default), "warning" or
+            "error".
 
         Returns
         -------
         int
             Length of the logged message string.
         """
-        return self._logFileEvent("Writing", file, completed=False, cmdline=cmdline)
+        return self._logFileEvent("Writing", file, completed=False, cmdline=cmdline, level=level)
 
-    def printReadFileEnd(self, file: str = "", cmdline: bool = True) -> int:
+    def printReadFileEnd(
+        self, file: str | os.PathLike[str], cmdline: bool = True, level: str = "info"
+    ) -> int:
         """
         Log the completion of reading a file.
 
         Parameters
         ----------
-        file : str, optional
+        file : str or os.PathLike
             Full or relative path to the file that was read.
         cmdline : bool, optional
-            Whether to also print the message to stdout (default True).
+            Whether to also print the message to the console (default True).
+        level : str, optional
+            Level of the logged line(s): "info" (default), "warning" or
+            "error".
 
         Returns
         -------
         int
             Length of the logged message string.
         """
-        return self._logFileEvent("Reading", file, completed=True, cmdline=cmdline)
+        return self._logFileEvent("Reading", file, completed=True, cmdline=cmdline, level=level)
 
-    def printWriteFileEnd(self, file: str = "", cmdline: bool = True) -> int:
+    def printWriteFileEnd(
+        self, file: str | os.PathLike[str], cmdline: bool = True, level: str = "info"
+    ) -> int:
         """
         Log the completion of writing a file.
 
         Parameters
         ----------
-        file : str, optional
+        file : str or os.PathLike
             Full or relative path to the file that was written.
         cmdline : bool, optional
-            Whether to also print the message to stdout (default True).
+            Whether to also print the message to the console (default True).
+        level : str, optional
+            Level of the logged line(s): "info" (default), "warning" or
+            "error".
 
         Returns
         -------
         int
             Length of the logged message string.
         """
-        return self._logFileEvent("Writing", file, completed=True, cmdline=cmdline)
+        return self._logFileEvent("Writing", file, completed=True, cmdline=cmdline, level=level)
 
 
 class StandardLoggingHandler(logging.Handler):

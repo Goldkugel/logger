@@ -21,6 +21,7 @@ Tests cover:
 - Multiprocessing (fork and spawn workers, fork while another thread logs)
 - LoggerConfig defaults, validated assignments and package exports
 - Console problems (unencodable characters, broken pipe)
+- Console streams (info to stdout, warnings and errors to stderr)
 - console setting and the {start} placeholder in file_name (one file per run)
 - Reconfiguration: replace=False and the logged change notice
 - Capturing Python's standard logging module
@@ -664,6 +665,12 @@ class TestPrintHeader:
         assert lines() == []
 
 
+    def test_level_parameter(self, make_logger):
+        logger, lines = make_logger(header_length=10)
+        logger.printHeader("Failed", cmdline=False, level="error")
+        assert all("[ERROR  ]" in line for line in lines())
+
+
 # --------------------------------------------------------------------------
 # File-processing helper methods
 # --------------------------------------------------------------------------
@@ -736,6 +743,40 @@ class TestFileProcessingHelpers:
         assert len(read_log_lines(log_folder)) == 1
 
 
+    @pytest.mark.parametrize("method", [
+        "printFileProcessingStart", "printFileProcessingEnd",
+        "printReadFileStart", "printReadFileEnd",
+        "printWriteFileStart", "printWriteFileEnd",
+    ])
+    def test_level_parameter(self, make_logger, method):
+        logger, lines = make_logger()
+        getattr(logger, method)("data.csv", cmdline=False, level="warning")
+        assert "[WARNING]" in lines()[0]
+
+    @pytest.mark.parametrize("method", [
+        "printFileProcessingStart", "printReadFileEnd", "printWriteFileStart",
+    ])
+    def test_empty_file_name_raises(self, make_logger, method):
+        """An empty name would be logged as ''; it is rejected instead."""
+        logger, lines = make_logger()
+        with pytest.raises(ValueError, match="file must not be empty"):
+            getattr(logger, method)("", cmdline=False)
+        assert lines() == []
+
+    def test_file_is_required(self, make_logger):
+        logger, _ = make_logger()
+        with pytest.raises(TypeError):
+            logger.printReadFileStart()
+
+    def test_trailing_separator_and_path_objects(self, make_logger, tmp_path):
+        import pathlib
+        logger, lines = make_logger()
+        logger.printWriteFileStart("results/embeddings/", cmdline=False)
+        logger.printReadFileEnd(pathlib.Path("/data/hp.obo"), cmdline=False)
+        assert lines()[0].endswith(" Writing file 'embeddings' started.\n")
+        assert lines()[1].endswith(" Reading file 'hp.obo' completed.\n")
+
+
 # --------------------------------------------------------------------------
 # printDataFrameRowCount()
 # --------------------------------------------------------------------------
@@ -782,6 +823,20 @@ class TestPrintDataFrameRowCount:
         logger, lines = make_logger()
         logger.printDataFrameRowCount([1, 2, 3, 4], cmdline=False)
         assert "Row count: 4" in lines()[0]
+
+
+    def test_print_row_count_is_the_generic_name(self, make_logger):
+        logger, lines = make_logger()
+        assert logger.printRowCount({"a": 1, "b": 2}, cmdline=False) == len("Row count: 2.")
+        assert logger.printRowCount(None, cmdline=False) == 0
+        assert lines()[0].endswith(" Row count: 2.\n")
+
+    def test_level_parameter(self, make_logger):
+        logger, lines = make_logger()
+        logger.printRowCount([], cmdline=False, level="warning")
+        logger.printDataFrameRowCount(pd.DataFrame(), cmdline=False, level="error")
+        assert "[WARNING] Row count: 0." in lines()[0]
+        assert "[ERROR  ] Row count: 0." in lines()[1]
 
 
 # --------------------------------------------------------------------------
@@ -912,7 +967,7 @@ def make_logger(tmp_path):
 def force_colors(monkeypatch):
     """Pretend stdout is a terminal, so that colors are applied."""
     monkeypatch.delenv("NO_COLOR", raising=False)
-    monkeypatch.setattr(Logger, "_useColors", staticmethod(lambda: True))
+    monkeypatch.setattr(Logger, "_useColors", staticmethod(lambda stream=None: True))
 
 
 class TestLevels:
@@ -951,10 +1006,10 @@ class TestLevels:
         logger.info("hidden")
         logger.warning("shown")
         logger.error("also shown")
-        out = capsys.readouterr().out
+        captured = capsys.readouterr()
         assert len(lines()) == 2
-        assert "hidden" not in out
-        assert "shown" in out and "also shown" in out
+        assert "hidden" not in captured.out + captured.err
+        assert "shown" in captured.err and "also shown" in captured.err
 
     def test_level_error_only_logs_errors(self, make_logger):
         logger, lines = make_logger(level="error")
@@ -970,7 +1025,8 @@ class TestLevels:
     def test_default_colors_on_console(self, make_logger, capsys, force_colors, level, code):
         logger, _ = make_logger()
         logger.log("Colored", level=level)
-        out = capsys.readouterr().out
+        captured = capsys.readouterr()
+        out = captured.out if level == "info" else captured.err
         assert out.startswith(code)
         assert out.rstrip("\n").endswith("\033[0m")
 
@@ -1134,9 +1190,9 @@ class TestException:
             raise ValueError("bad value")
         except ValueError:
             logger.exception("Mapping failed")
-        out = capsys.readouterr().out
-        assert "ValueError: bad value" in out
-        assert out == "".join(lines())
+        err = capsys.readouterr().err
+        assert "ValueError: bad value" in err
+        assert err == "".join(lines())
 
     def test_logged_even_with_minimum_level_error(self, make_logger):
         logger, lines = make_logger(level="error")
@@ -1260,6 +1316,103 @@ class TestThreadSafety:
             if line.rstrip("\n").endswith("=") and "T" in line:
                 assert content[i - 1].rstrip("\n").endswith("=" * 10)
                 assert content[i + 1].rstrip("\n").endswith("=" * 10)
+
+
+# --------------------------------------------------------------------------
+# Console streams
+# --------------------------------------------------------------------------
+
+class RecordingStream(io.StringIO):
+    """stdout replacement that records when it is flushed."""
+
+    def __init__(self, events, name):
+        super().__init__()
+        self._events = events
+        self._name   = name
+
+    def write(self, text):
+        self._events.append(f"{self._name} write")
+        return super().write(text)
+
+    def flush(self):
+        self._events.append(f"{self._name} flush")
+        super().flush()
+
+
+class TestConsoleStreams:
+    """
+    Tests that info messages go to stdout and warnings and errors to
+    stderr, as diagnostics usually do.
+    """
+
+    def test_levels_go_to_their_stream(self, make_logger, capsys):
+        logger, _ = make_logger()
+        logger.info("to stdout")
+        logger.warning("warning to stderr")
+        logger.error("error to stderr")
+        captured = capsys.readouterr()
+        assert "to stdout" in captured.out
+        assert "warning to stderr" in captured.err and "error to stderr" in captured.err
+        assert "stderr" not in captured.out
+        assert "to stdout" not in captured.err
+
+    def test_step_messages_split_by_level(self, make_logger, capsys):
+        logger, _ = make_logger()
+        with pytest.raises(ValueError):
+            with logger.step("Parsing"):
+                raise ValueError("bad row")
+        captured = capsys.readouterr()
+        assert "Step 'Parsing' started." in captured.out
+        assert "Step 'Parsing' failed after" in captured.err
+
+    def test_stdout_is_flushed_before_stderr(self, make_logger, monkeypatch):
+        """Keeps the order of lines when both streams go to one file."""
+        events = []
+        monkeypatch.setattr("sys.stdout", RecordingStream(events, "stdout"))
+        monkeypatch.setattr("sys.stderr", RecordingStream(events, "stderr"))
+        logger, _ = make_logger()
+        logger.info("first")
+        events.clear()
+        logger.error("second")
+        assert events.index("stdout flush") < events.index("stderr write")
+
+    def test_closed_stderr_does_not_affect_stdout(self, make_logger, monkeypatch, capsys):
+        monkeypatch.setattr("sys.stderr", ClosedPipe())
+        logger, lines = make_logger()
+        logger.error("Lost on console")
+        logger.info("Still on stdout")
+        assert "Still on stdout" in capsys.readouterr().out
+        content = lines()
+        assert "[WARNING] Console output to stderr is closed (broken pipe)" in content[1]
+        assert content[2].endswith("] Still on stdout\n")
+
+    def test_closed_stdout_found_by_flush_is_reported(self, make_logger, monkeypatch):
+        monkeypatch.setattr("sys.stdout", ClosedPipe())
+        logger, lines = make_logger()
+        logger.error("Error after closed stdout")
+        content = lines()
+        assert content[0].endswith("] Error after closed stdout\n")
+        assert "Console output to stdout is closed" in content[1]
+
+    def test_colors_depend_on_the_target_stream(self, make_logger, capsys, monkeypatch):
+        """An error is colored if stderr is a terminal, even if stdout is not."""
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setattr(
+            Logger, "_useColors", staticmethod(lambda stream=None: stream is sys.stderr)
+        )
+        logger, _ = make_logger()
+        logger.info("plain")
+        logger.error("red")
+        captured = capsys.readouterr()
+        assert "\033[" not in captured.out
+        assert captured.err.startswith("\033[31m")
+
+    def test_missing_stream_is_skipped(self, make_logger, monkeypatch):
+        """pythonw and some services run with sys.stderr set to None."""
+        monkeypatch.setattr("sys.stderr", None)
+        logger, lines = make_logger()
+        logger.error("file only")
+        assert lines()[0].endswith("] file only\n")
 
 
 # --------------------------------------------------------------------------
@@ -1513,9 +1666,11 @@ class TestStandardLogging:
         logger.captureStandardLogging()
         logging.getLogger("lib.console").warning("visible")
         captured = capsys.readouterr()
-        assert "lib.console: visible" in captured.out
-        # Not also printed by the standard logging module's fallback.
-        assert "visible" not in captured.err
+        # Printed once to stderr (as a warning), not also by the standard
+        # logging module's own fallback.
+        assert "lib.console: visible" in captured.err
+        assert captured.err.count("visible") == 1
+        assert "visible" not in captured.out
 
     def test_unknown_level_raises(self, make_logger):
         logger, _ = make_logger()
@@ -1583,6 +1738,9 @@ class TestMultiprocessing:
         "fork" not in multiprocessing.get_all_start_methods(),
         reason="fork is not available on this platform",
     )
+    # Forking while another thread runs is exactly what this test checks;
+    # Python 3.12+ warns about it in general.
+    @pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
     def test_fork_while_another_thread_logs_does_not_hang(self, make_logger):
         """
         A worker forked while another thread holds the logger's lock gets a
@@ -1724,7 +1882,7 @@ class TestConsoleProblems:
         content = lines()
         assert len(content) == 3
         assert content[0].endswith("] First\n")
-        assert "[WARNING] Console output is closed (broken pipe)" in content[1]
+        assert "[WARNING] Console output to stdout is closed (broken pipe)" in content[1]
         assert content[2].endswith("] Second\n")
 
     def test_reset_switches_console_on_again(self, make_logger, monkeypatch, capsys):

@@ -6,7 +6,7 @@ A lightweight, singleton-based logging utility for Python projects that writes t
 
 - **Singleton pattern** — only one `Logger` instance exists per process, and it tracks the time since the instance was first created (`start_time`).
 - **YAML-based configuration** — reads settings such as log folder, file name, header formatting, and timestamp format from a config file.
-- **Console + file logging** — every message is written to the log file, with optional mirroring to stdout (per call, or switched off entirely with `console: false`).
+- **Console + file logging** — every message is written to the log file, with optional mirroring to the console: info messages to stdout, warnings and errors to stderr (per call, or switched off entirely with `console: false`).
 - **One log file per run (optional)** — `file_name: "run_{start:%Y%m%d_%H%M%S}.log"` starts a new file for every run instead of appending to one file.
 - **Log levels with colors** — `info`, `warning` and `error` messages, a configurable minimum level, and a configurable console color per level (white, yellow and red by default).
 - **Optional runtime tracking** — add the elapsed time since the logger started to each log entry, in minutes or as `HH:MM:SS`.
@@ -20,11 +20,11 @@ A lightweight, singleton-based logging utility for Python projects that writes t
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.9+
 - [`PyYAML`](https://pyyaml.org/)
 - [`pydantic`](https://docs.pydantic.dev/) 2.x
 
-These runtime dependencies are declared in `pyproject.toml` and are installed automatically with the package. [`pandas`](https://pandas.pydata.org/) is not required: `printDataFrameRowCount()` accepts a `pandas.DataFrame`, but only calls `len()` on it.
+These runtime dependencies are declared in `pyproject.toml` and are installed automatically with the package. [`pandas`](https://pandas.pydata.org/) is not required: `printRowCount()` (and its older name `printDataFrameRowCount()`) accepts a `pandas.DataFrame`, but only calls `len()` on it.
 
 ```bash
 pip install git+https://github.com/Goldkugel/logger.git
@@ -90,7 +90,7 @@ logger.printFileProcessingEnd("input_data.csv")
 # Log DataFrame details
 import pandas as pd
 df = pd.read_csv("input_data.csv")
-logger.printDataFrameRowCount(df)
+logger.printRowCount(df)                 # also works for lists, dicts, ...
 
 # Log read/write operations
 logger.printReadFileStart("input_data.csv")
@@ -167,22 +167,24 @@ A log file then looks like this:
 | `error(string, cmdline=True)` | Same as `log(..., level="error")`. | `None` |
 | `exception(string="", exc=None, cmdline=True)` | Logs an error with the traceback of `exc`, or of the exception currently being handled. | `None` |
 | `step(name, cmdline=True)` | Context manager logging the start, end and duration of a block; logs an error and re-raises if the block fails. | context manager |
-| `printHeader(text, cmdline=True)` | Logs a bordered header block containing `text`. | `int` — combined length of header lines |
-| `printFileProcessingStart(file, cmdline=True)` | Logs the start of processing for `file`. | `int` — message length |
-| `printFileProcessingEnd(file, cmdline=True)` | Logs completion of processing for `file`. | `int` — message length |
-| `printDataFrameRowCount(data, cmdline=True)` | Logs the row count of a `pandas.DataFrame` (or any object supporting `len()`). | `int` — message length, or `0` if `data` is `None` |
-| `printReadFileStart(file, cmdline=True)` | Logs the start of reading `file`. | `int` — message length |
-| `printReadFileEnd(file, cmdline=True)` | Logs completion of reading `file`. | `int` — message length |
-| `printWriteFileStart(file, cmdline=True)` | Logs the start of writing `file`. | `int` — message length |
-| `printWriteFileEnd(file, cmdline=True)` | Logs completion of writing `file`. | `int` — message length |
+| `printHeader(text, cmdline=True, level="info")` | Logs a bordered header block containing `text`. | `int` — combined length of header lines |
+| `printFileProcessingStart(file, cmdline=True, level="info")` | Logs the start of processing for `file` (a path or `os.PathLike`; only its last component is logged, and an empty name raises a `ValueError`). | `int` — message length |
+| `printFileProcessingEnd(file, cmdline=True, level="info")` | Logs completion of processing for `file`. | `int` — message length |
+| `printRowCount(data, cmdline=True, level="info")` | Logs the length of `data` (a `pandas.DataFrame` or any object supporting `len()`) as `Row count: N.` | `int` — message length, or `0` if `data` is `None` |
+| `printDataFrameRowCount(data, cmdline=True, level="info")` | Older name of `printRowCount()`, kept for existing callers. | as `printRowCount()` |
+| `printReadFileStart(file, cmdline=True, level="info")` | Logs the start of reading `file`. | `int` — message length |
+| `printReadFileEnd(file, cmdline=True, level="info")` | Logs completion of reading `file`. | `int` — message length |
+| `printWriteFileStart(file, cmdline=True, level="info")` | Logs the start of writing `file`. | `int` — message length |
+| `printWriteFileEnd(file, cmdline=True, level="info")` | Logs completion of writing `file`. | `int` — message length |
 | `logFilePath()` | Path of the current log file, with `{start}` in `file_name` filled in. | `str` |
 
 ## Notes & Potential Gotchas
 
 - **Config loading**: the configuration is loaded on the first `Logger()` call, or whenever a config is passed explicitly. A bare `Logger()` call after that keeps the current configuration; `Logger(config=...)` reloads it and replaces the configuration for all references to the singleton, and logs which settings changed; `Logger(config=..., replace=False)` keeps a configuration that is already loaded. A YAML file without a `logger` section (or an empty file) raises a `KeyError`; an empty `logger:` section uses the defaults. Settings changed later through `logger.config` are validated too, so `logger.config.level = "debug"` raises a `ValidationError` right away.
-- **Colors**: only console output is colored, and only when stdout is a terminal and `NO_COLOR` is not set to a non-empty value; the log file never contains color codes. In notebooks, output is therefore not colored.
+- **Console streams**: info messages go to stdout, warnings and errors (including tracebacks) to stderr. Before a line is written to stderr, stdout is flushed, so that lines keep their order when both streams go to the same file (`python run.py > out.txt 2>&1`).
+- **Colors**: only console output is colored, and only when the stream it goes to is a terminal and `NO_COLOR` is not set to a non-empty value; the log file never contains color codes. In notebooks, output is therefore not colored.
 - **Threads and processes**: logging from several threads is safe. `multiprocessing` workers depend on the start method: with `fork` (the Linux default before Python 3.14) a worker inherits the parent's configuration and runtime clock, and gets a fresh lock, so it does not hang if another thread was logging at the moment of the fork; with `spawn` or `forkserver` (the default on macOS and Windows, and on Linux from Python 3.14) it starts without a `Logger`, so a bare `Logger()` loads `./config/config.yaml` and starts a new runtime clock — pass the configuration to the worker if it differs. Lines from several processes go to the same file in the order they are written, without coordination between the processes.
-- **Console problems**: each line is written to the log file before it is printed, so console problems never lose it. Characters the console cannot encode are replaced on the console only (e.g. by `?`). If the console stops accepting output, e.g. because the output was piped into `head`, console output is switched off for the rest of the run and a warning is written to the log file; Python may still report the closed pipe on stderr when the program exits.
+- **Console problems**: each line is written to the log file before it is printed, so console problems never lose it. Characters the console cannot encode are replaced on the console only (e.g. by `?`). If stdout or stderr stops accepting output, e.g. because the output was piped into `head`, output to that stream is switched off for the rest of the run and a warning is written to the log file; Python may still report the closed pipe on stderr when the program exits.
 - **Log folder**: the folder configured in `folder` is created automatically on the first `log()` call, and again if it is deleted during the run.
 - **One file per run**: `{start}` in `file_name` is the moment the `Logger` singleton was first created, so all lines of a run go to the same file, also when the configuration is reloaded. `Logger.reset()` starts a new file. Two runs started within the same second share a file unless the format includes `%f` (microseconds). `multiprocessing` workers started with `spawn` or `forkserver` create their own `Logger` and therefore their own file. Use `Logger().logFilePath()` to find the file of the current run.
 - **Console output**: `console: false` keeps all messages in the log file only, whatever `cmdline` the calls pass, e.g. for batch jobs whose stdout is saved anyway.
@@ -209,7 +211,7 @@ pytest --cov=logger --cov-branch --cov-report=term-missing
 
 Most tests use `./config/config.yaml` and remove the log file configured there before and after each test; the others write to temporary folders. The `test` extra installs `pytest`, `pytest-cov` and `pandas` (used to build test DataFrames).
 
-The tests also run automatically on GitHub Actions for every push and pull request (Python 3.8, 3.11 and 3.14 on Ubuntu 24.04). Each run reports the test coverage in the job log and in the run's summary page; see [`.github/workflows/tests.yml`](./.github/workflows/tests.yml).
+The tests also run automatically on GitHub Actions for every push and pull request (Python 3.9, 3.11 and 3.14 on Ubuntu 24.04). Each run reports the test coverage in the job log and in the run's summary page; see [`.github/workflows/tests.yml`](./.github/workflows/tests.yml).
 
 ## License
 
