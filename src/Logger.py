@@ -117,7 +117,8 @@ class Logger:
     _instance : Logger or None
         The single shared instance, managed by __new__.
     _lock : threading.RLock
-        Lock guarding singleton creation, configuration loading and writing.
+        Lock guarding singleton creation, configuration loading, writing
+        and the standard logging capture.
         Replaced by a fresh lock in forked child processes.
     _closed_streams : set of str
         Names of the console streams ("stdout", "stderr") that have stopped
@@ -140,8 +141,11 @@ class Logger:
     _instance : Logger | None       = None
 
     # Re-entrant, because printHeader() holds the lock while calling log()
-    # three times, so that the header lines stay together. (exception()
-    # needs no lock: it logs message and traceback as one entry.)
+    # three times, so that the header lines stay together, _logWith() logs
+    # the warning about a closed console stream while holding it, and
+    # reset() and captureStandardLogging() call releaseStandardLogging().
+    # (exception() needs no lock: it logs message and traceback as one
+    # entry.)
     _lock     : threading.RLock     = threading.RLock()
 
     _closed_streams: set[str]       = set()

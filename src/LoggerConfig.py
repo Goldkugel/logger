@@ -115,14 +115,16 @@ class LoggerConfig(BaseModel):
     # "minutes" -> "(3 Minutes)", "hms" -> "(00:03:12)".
     runtime_format: RuntimeFormat = "minutes"
 
-    # Whether log messages are also printed to stdout. False keeps all
+    # Whether log messages are also printed to the console (info to stdout,
+    # warnings and errors to stderr). False keeps all
     # output in the log file, whatever `cmdline` the individual calls pass;
     # useful for batch jobs whose stdout is saved anyway.
     console: bool       = True
 
     # Console color per log level (see LevelColors). Colors are only used
-    # when stdout is a terminal and the NO_COLOR environment variable is not
-    # set, so redirected output and log files never contain color codes.
+    # when the stream a line goes to is a terminal and the NO_COLOR
+    # environment variable is not set to a non-empty value, so redirected
+    # output and log files never contain color codes.
     colors: LevelColors = Field(default_factory=LevelColors)
 
     @field_validator("encoding")

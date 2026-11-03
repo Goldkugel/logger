@@ -11,7 +11,8 @@ Tests cover:
   cmdline
 - File-processing helper methods (printFileProcessingStart/End, etc.)
 - One common structure for all messages the logger writes itself
-- printDataFrameRowCount() — row count logging, None handling, cmdline
+- printRowCount() and printDataFrameRowCount() — row count logging, None
+  handling, cmdline
 - Logger.reset() and passing the config as a dict (section or whole
   configuration), path object or LoggerConfig
 - Log levels, minimum level, level helpers and console colors
@@ -25,6 +26,8 @@ Tests cover:
 - console setting and the {start} placeholder in file_name (one file per run)
 - Reconfiguration: replace=False and the logged change notice
 - Capturing Python's standard logging module
+
+The file helpers (src/FileUtils.py) are tested in tests/FileUtilsTest.py.
 
 Run from the repository root with:
     pytest -v
@@ -1812,7 +1815,10 @@ class TestLoggerConfig:
         assert lines()[1].rstrip("\n").endswith("] ==")
 
     def test_package_exports(self):
-        assert sorted(logger_package.__all__) == ["LevelColors", "Logger", "LoggerConfig"]
+        assert sorted(logger_package.__all__) == [
+            "LevelColors", "Logger", "LoggerConfig",
+            "lockedFile", "makeParentFolder", "writeAtomically", "writeJSON",
+        ]
         for name in logger_package.__all__:
             assert hasattr(logger_package, name)
 

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "logger"
 description = "Singleton, YAML-configured logger with log levels, console colors and step timing."
 readme = "README.md"
-version = "1.4.0"
+version = "1.5.0"
 requires-python = ">=3.9"
 authors = [{ name = "Peter Pallaoro", email = "peter.pallaoro@tum.de" }]
 # The license is given as a classifier instead of an SPDX `license` field,

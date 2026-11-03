@@ -17,6 +17,7 @@ A lightweight, singleton-based logging utility for Python projects that writes t
 - **No silent reconfiguration** — library code can pass its config with `replace=False`, and every change of a loaded configuration is logged.
 - **Formatted headers** — print a bordered header block to visually separate sections in the log.
 - **Convenience helpers** — pre-built methods for common logging patterns (file processing, reading, writing, DataFrame row counts).
+- **File helpers** — `lockedFile()`, `writeAtomically()` and `writeJSON()` let runs that share files (e.g. the jobs of a Slurm job array) take turns and never leave a partially written file.
 
 ## Requirements
 
@@ -178,6 +179,24 @@ A log file then looks like this:
 | `printWriteFileEnd(file, cmdline=True, level="info")` | Logs completion of writing `file`. | `int` — message length |
 | `logFilePath()` | Path of the current log file, with `{start}` in `file_name` filled in. | `str` |
 
+### File helpers
+
+For runs that share files, e.g. the jobs of a Slurm job array. They need only the standard library and are imported from the package itself (`from logger import lockedFile, writeJSON`).
+
+| Function | Description | Returns |
+|---|---|---|
+| `lockedFile(path)` | Context manager holding an exclusive lock on `<path>.lock` while the block runs, so processes updating `path` take turns. Where file locks are not supported (Windows, or a file system without lock support), this is logged and the block runs without a lock. | context manager |
+| `writeAtomically(path, write)` | Calls `write(tmp_path)` to write `<path>.tmp`, which then replaces `path` in one operation, so an interrupted write never leaves a partial file. The temporary file is removed if writing fails. | `None` |
+| `writeJSON(data, path)` | Writes `data` as indented UTF-8 JSON with `writeAtomically()`. | `None` |
+| `makeParentFolder(path)` | Creates the folder of the file at `path` if needed. | `None` |
+
+```python
+from logger import lockedFile, writeJSON
+
+with lockedFile("./data/output/runs.json"):
+    writeJSON(runs, "./data/output/runs.json")
+```
+
 ## Notes & Potential Gotchas
 
 - **Config loading**: the configuration is loaded on the first `Logger()` call, or whenever a config is passed explicitly. A bare `Logger()` call after that keeps the current configuration; `Logger(config=...)` reloads it and replaces the configuration for all references to the singleton, and logs which settings changed; `Logger(config=..., replace=False)` keeps a configuration that is already loaded. A YAML file without a `logger` section (or an empty file) raises a `KeyError`; an empty `logger:` section uses the defaults. Settings changed later through `logger.config` are validated too, so `logger.config.level = "debug"` raises a `ValidationError` right away.
@@ -209,7 +228,7 @@ To also see which lines and branches of the package the tests cover:
 pytest --cov=logger --cov-branch --cov-report=term-missing
 ```
 
-Most tests use `./config/config.yaml` and remove the log file configured there before and after each test; the others write to temporary folders. The `test` extra installs `pytest`, `pytest-cov` and `pandas` (used to build test DataFrames).
+`tests/LoggerTest.py` covers `Logger` and `LoggerConfig`, `tests/FileUtilsTest.py` the file helpers. Most tests use `./config/config.yaml` and remove the log file configured there before and after each test; the others write to temporary folders. The `test` extra installs `pytest`, `pytest-cov` and `pandas` (used to build test DataFrames).
 
 The tests also run automatically on GitHub Actions for every push and pull request (Python 3.9, 3.11 and 3.14 on Ubuntu 24.04). Each run reports the test coverage in the job log and in the run's summary page; see [`.github/workflows/tests.yml`](./.github/workflows/tests.yml).
 
