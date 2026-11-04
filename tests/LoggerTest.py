@@ -557,7 +557,9 @@ class TestLog:
     def test_built_in_messages_share_one_structure(self, make_logger):
         """
         Every message the logger writes itself is one line of the form
-        [<timestamp>] [<LEVEL>] (<runtime>) <sentence ending in ".">.
+        [<timestamp>] [<LEVEL>] (<runtime>) <sentence ending in ".">, or
+        <task>... when a task starts, followed by "<task> completed" (or
+        "failed") when it ends.
         (Header lines and exception() tracebacks are tested separately.)
         """
         logger, lines = make_logger(log_runtime=True)
@@ -577,12 +579,17 @@ class TestLog:
                     raise error
         pattern = re.compile(
             r"^\[[^\]]+\] \[(INFO   |WARNING|ERROR  )\] \(\d+ Minutes?\) "
-            r"[A-Za-z(][^\n]*[^.]\.\n$"
+            r"[A-Za-z(][^\n]*[^.](\.|\.\.\.)\n$"
         )
         content = lines()
         assert len(content) == 14
         for line in content:
             assert pattern.match(line), line
+        messages = [line.split(") ", 1)[1].rstrip("\n") for line in content]
+        for index, message in enumerate(messages):
+            if message.endswith("..."):
+                task = message[:-3]
+                assert messages[index + 1].startswith((f"{task} completed", f"{task} failed")), message
 
 
 # --------------------------------------------------------------------------
@@ -693,8 +700,8 @@ class TestFileProcessingHelpers:
         logger, log_folder = logger_instance
         ret = logger.printFileProcessingStart("/path/to/input_data.csv")
         lines = read_log_lines(log_folder)
-        assert lines[0].endswith(" Processing file 'input_data.csv' started.\n")
-        assert ret == len("Processing file 'input_data.csv' started.")
+        assert lines[0].endswith(" Processing file 'input_data.csv'...\n")
+        assert ret == len("Processing file 'input_data.csv'...")
 
     def test_print_file_processing_end(self, logger_instance):
         logger, log_folder = logger_instance
@@ -706,7 +713,7 @@ class TestFileProcessingHelpers:
         logger, log_folder = logger_instance
         logger.printReadFileStart("data.csv")
         lines = read_log_lines(log_folder)
-        assert lines[0].endswith(" Reading file 'data.csv' started.\n")
+        assert lines[0].endswith(" Reading file 'data.csv'...\n")
 
     def test_print_read_file_end(self, logger_instance):
         logger, log_folder = logger_instance
@@ -718,7 +725,7 @@ class TestFileProcessingHelpers:
         logger, log_folder = logger_instance
         logger.printWriteFileStart("data.csv")
         lines = read_log_lines(log_folder)
-        assert lines[0].endswith(" Writing file 'data.csv' started.\n")
+        assert lines[0].endswith(" Writing file 'data.csv'...\n")
 
     def test_print_write_file_end(self, logger_instance):
         logger, log_folder = logger_instance
@@ -776,7 +783,7 @@ class TestFileProcessingHelpers:
         logger, lines = make_logger()
         logger.printWriteFileStart("results/embeddings/", cmdline=False)
         logger.printReadFileEnd(pathlib.Path("/data/hp.obo"), cmdline=False)
-        assert lines()[0].endswith(" Writing file 'embeddings' started.\n")
+        assert lines()[0].endswith(" Writing file 'embeddings'...\n")
         assert lines()[1].endswith(" Reading file 'hp.obo' completed.\n")
 
 
@@ -1214,7 +1221,7 @@ class TestStep:
         logger, lines = make_logger()
         with logger.step("Loading", cmdline=False):
             pass
-        assert "Step 'Loading' started." in lines()[0]
+        assert "Step 'Loading'..." in lines()[0]
         assert "[INFO   ] Step 'Loading' completed in 00:00:0" in lines()[1]
 
     def test_failure_is_logged_and_reraised(self, make_logger):
@@ -1265,7 +1272,7 @@ class TestStep:
         with logger.step("Loading"):
             pass
         out = capsys.readouterr().out
-        assert "Step 'Loading' started." in out
+        assert "Step 'Loading'..." in out
         assert "Step 'Loading' completed in" in out
 
     def test_minimum_level_hides_progress_but_not_failure(self, make_logger):
@@ -1365,7 +1372,7 @@ class TestConsoleStreams:
             with logger.step("Parsing"):
                 raise ValueError("bad row")
         captured = capsys.readouterr()
-        assert "Step 'Parsing' started." in captured.out
+        assert "Step 'Parsing'..." in captured.out
         assert "Step 'Parsing' failed after" in captured.err
 
     def test_stdout_is_flushed_before_stderr(self, make_logger, monkeypatch):

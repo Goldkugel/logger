@@ -699,7 +699,7 @@ class Logger:
             with logger.step("Loading SCT"):
                 ...
 
-        Logs "Step 'Loading SCT' started." on entry and
+        Logs "Step 'Loading SCT'..." on entry and
         "Step 'Loading SCT' completed in 00:01:23.45." on exit. If the block
         raises, an error "Step 'Loading SCT' failed after 00:00:01.20
         (ValueError: bad row)." is logged on one line (see _describeError())
@@ -712,7 +712,7 @@ class Logger:
         cmdline : bool, optional
             Whether to also print the messages to the console (default True).
         """
-        self.log(f"Step '{name}' started.", cmdline)
+        self.log(f"Step '{name}'...", cmdline)
         start = time.monotonic()
 
         try:
@@ -886,8 +886,9 @@ class Logger:
         level: str = "info",
     ) -> int:
         """
-        Log "<action> file '<name>' started." or "<action> file '<name>' completed.",
-        matching the wording of step().
+        Log "<action> file '<name>'..." or "<action> file '<name>' completed.",
+        matching the wording of step(): a task is "<Task>..." when it starts and
+        "<Task> completed." when it is done.
 
         Shared implementation of the printFileProcessing*, printReadFile*
         and printWriteFile* helpers. Only the last component of `file` is
@@ -908,9 +909,8 @@ class Logger:
         if not path:
             raise ValueError("file must not be empty")
 
-        event   = "completed" if completed else "started"
         name    = os.path.basename(os.path.normpath(path))
-        message = f"{action} file '{name}' {event}."
+        message = f"{action} file '{name}'" + (" completed." if completed else "...")
         self.log(message, cmdline, level)
         return len(message)
 

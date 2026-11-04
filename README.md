@@ -149,7 +149,7 @@ Captured records appear as `<logger name>: <message>` with the matching level, e
 A log file then looks like this:
 
 ```
-[2026-10-29 10:32:01] [INFO   ] (0 Minutes) Step 'Loading SNOMED CT' started.
+[2026-10-29 10:32:01] [INFO   ] (0 Minutes) Step 'Loading SNOMED CT'...
 [2026-10-29 10:35:13] [WARNING] (3 Minutes) 12 concepts without a label were skipped.
 [2026-10-29 10:35:14] [INFO   ] (3 Minutes) Step 'Loading SNOMED CT' completed in 00:03:12.84.
 ```
@@ -208,7 +208,7 @@ with lockedFile("./data/output/runs.json"):
 - **One file per run**: `{start}` in `file_name` is the moment the `Logger` singleton was first created, so all lines of a run go to the same file, also when the configuration is reloaded. `Logger.reset()` starts a new file. Two runs started within the same second share a file unless the format includes `%f` (microseconds). `multiprocessing` workers started with `spawn` or `forkserver` create their own `Logger` and therefore their own file. Use `Logger().logFilePath()` to find the file of the current run.
 - **Console output**: `console: false` keeps all messages in the log file only, whatever `cmdline` the calls pass, e.g. for batch jobs whose stdout is saved anyway.
 - **Encoding**: the log file is written with the configured `encoding` (default UTF-8), independent of the system locale.
-- **Message format**: the messages the logger writes itself are one sentence each, e.g. `Step 'Load' started.`, `Reading file 'hp.obo' completed.` or `Row count: 3.` A step failure gives the error on the same line (`(ValueError: bad row)`); only `exception()` adds the traceback on the following lines.
+- **Message format**: the messages the logger writes itself are one sentence each, e.g. `Step 'Load'...`, `Reading file 'hp.obo' completed.` or `Row count: 3.` A task is logged as `<Task>...` when it starts and as `<Task> completed.` (for a step: `completed in <duration>.`) as soon as it is done; its results are logged in between. A step failure gives the error on the same line (`(ValueError: bad row)`); only `exception()` adds the traceback on the following lines.
 - **Header width**: `printHeader` centers `text` within `header_length - 2` characters; longer text is truncated so the header always has the configured width.
 
 ## Tests
