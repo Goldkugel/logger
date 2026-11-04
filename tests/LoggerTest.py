@@ -1,41 +1,13 @@
 """
-Test suite for the Logger class and LoggerConfig model.
+Test suite for the Logger class and LoggerConfig model: singleton, config
+loading and sources, log(), printHeader(), the file and row count helpers,
+levels and colors, runtime formats, exception() and step(), thread safety,
+multiprocessing, console streams and problems, the {start} placeholder,
+reconfiguration and the standard logging capture. The file helpers are
+tested in tests/FileUtilsTest.py.
 
-Tests cover:
-- Singleton behaviour (__new__, start_time, shared config, bare Logger() calls)
-- Configuration loading (valid YAML, missing file, missing or empty section,
-  empty file, invalid values)
-- log() — file writing, timestamps, runtime, stdout, None handling, encoding,
-  folder creation
-- printHeader() — line count, border characters, return value, truncation,
-  cmdline
-- File-processing helper methods (printFileProcessingStart/End, etc.)
-- One common structure for all messages the logger writes itself
-- printRowCount() and printDataFrameRowCount() — row count logging, None
-  handling, cmdline
-- Logger.reset() and passing the config as a dict (section or whole
-  configuration), path object or LoggerConfig
-- Log levels, minimum level, level helpers and console colors
-- Runtime display formats ("minutes", "hms")
-- exception() and step()
-- Thread safety
-- Multiprocessing (fork and spawn workers, fork while another thread logs)
-- LoggerConfig defaults, validated assignments and package exports
-- Console problems (unencodable characters, broken pipe)
-- Console streams (info to stdout, warnings and errors to stderr)
-- console setting and the {start} placeholder in file_name (one file per run)
-- Reconfiguration: replace=False and the logged change notice
-- Capturing Python's standard logging module
-
-The file helpers (src/FileUtils.py) are tested in tests/FileUtilsTest.py.
-
-Run from the repository root with:
-    pytest -v
-(pyproject.toml points pytest at tests/*Test.py.)
-
-The real ./config/config.yaml is used as the default configuration for most
-tests. Run pytest from the repository root so that relative paths resolve
-correctly.
+Run with `pytest -v` from the repository root, so that the real
+./config/config.yaml, used by most tests, resolves.
 """
 
 from __future__ import annotations
@@ -69,11 +41,8 @@ from logger import LevelColors, Logger, LoggerConfig
 @pytest.fixture(autouse=True)
 def reset_singleton():
     """
-    Reset the Logger singleton before and after every test.
-
-    Logger stores its instance, config, and start_time as class-level
-    attributes, so without this reset, state leaks between tests and the
-    order in which tests run would affect their outcome.
+    Reset the Logger singleton around every test, so that its class-level
+    state does not leak between tests.
     """
     Logger.reset()
     yield
@@ -83,18 +52,13 @@ def reset_singleton():
 @pytest.fixture
 def config_file():
     """
-    Point tests at the project's real logger configuration file
-    (./config/config.yaml).
-
-    The log file named in that config is removed before and after each
-    test so that tests asserting on exact line counts always start with
-    a clean slate — the same guarantee a fresh tmp_path would give.
+    Point tests at the real ./config/config.yaml and remove its log file
+    before and after each test, so line counts start from an empty file.
 
     Yields
     ------
     tuple[str, str]
-        (config_path, log_folder) — the path to the YAML config file and
-        the log output directory read from it.
+        (config_path, log_folder) read from that file.
     """
     config_path = "./config/config.yaml"
     with open(config_path, "r") as f:
@@ -107,13 +71,11 @@ def config_file():
     os.makedirs(log_folder, exist_ok=True)
     log_path = os.path.join(log_folder, file_name)
 
-    # Remove any leftover log file from a previous run before the test starts.
     if os.path.exists(log_path):
         os.remove(log_path)
 
     yield config_path, log_folder
 
-    # Clean up after the test as well so the log directory stays tidy.
     if os.path.exists(log_path):
         os.remove(log_path)
 
@@ -121,13 +83,12 @@ def config_file():
 @pytest.fixture
 def logger_instance(config_file):
     """
-    Build a Logger using the real config file and return it together with
-    the log folder path (needed by helper read_log_lines).
+    Build a Logger from the real config file.
 
     Returns
     -------
     tuple[Logger, str]
-        (logger, log_folder)
+        (logger, log_folder), the folder as needed by read_log_lines().
     """
     config_path, log_folder = config_file
     logger = Logger(config=config_path)
@@ -135,12 +96,7 @@ def logger_instance(config_file):
 
 
 def read_log_lines(log_folder: str, file_name: str = "output.log") -> list[str]:
-    """
-    Read all lines from the log file and return them as a list.
-
-    Returns an empty list if the file does not yet exist, which lets
-    tests that assert on an empty log avoid a FileNotFoundError.
-    """
+    """Read all lines of the log file, or [] if it does not exist yet."""
     path = os.path.join(log_folder, file_name)
     if not os.path.exists(path):
         return []
@@ -187,8 +143,6 @@ class TestSingleton:
         config_path, _ = config_file
         logger1 = Logger(config=config_path)
 
-        # Build a second, deliberately different config in a temp directory
-        # so this test does not depend on or modify the real config file.
         other_folder = tmp_path / "other_logs"
         other_folder.mkdir()
         other_config_path = tmp_path / "other_config.yaml"
@@ -254,9 +208,8 @@ class TestConfigLoading:
 
     def test_loads_expected_fields(self, logger_instance):
         """
-        Config fields loaded from YAML must match what the file actually
-        contains — checked dynamically so this test stays correct even if
-        the config file is updated.
+        Loaded fields match the config file, read dynamically so the test
+        stays correct when the file changes.
         """
         logger, _ = logger_instance
         with open("./config/config.yaml", "r") as f:
@@ -687,13 +640,9 @@ class TestPrintHeader:
 
 class TestFileProcessingHelpers:
     """
-    Tests for the file-processing helper methods:
-    printFileProcessingStart/End, printReadFileStart/End,
-    printWriteFileStart/End.
-
-    Verifies that only the basename of the path is logged (not the full
-    directory), that the return value equals the message length, and that
-    cmdline=False keeps the message off stdout.
+    Tests for printFileProcessingStart/End, printReadFileStart/End and
+    printWriteFileStart/End: only the file name is logged, and the return
+    value is the message length.
     """
 
     def test_print_file_processing_start(self, logger_instance):
@@ -788,14 +737,13 @@ class TestFileProcessingHelpers:
 
 
 # --------------------------------------------------------------------------
-# printDataFrameRowCount()
+# printRowCount() and printDataFrameRowCount()
 # --------------------------------------------------------------------------
 
 class TestPrintDataFrameRowCount:
     """
-    Tests for Logger.printDataFrameRowCount() — logs the row count of a
-    DataFrame, or does nothing when None is passed; cmdline=False keeps
-    the message off stdout.
+    Tests for printRowCount() and printDataFrameRowCount(): the row count
+    of a DataFrame or any sized object, nothing for None.
     """
 
     def test_logs_row_count_for_non_empty_dataframe(self, logger_instance):

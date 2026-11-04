@@ -2,12 +2,10 @@
 Singleton logging utility shared by the pipeline packages (adapter,
 normalizer, embedder, model, ...).
 
-Provides the Logger class, which reads its configuration from a YAML file
-(or a mapping or LoggerConfig), writes timestamped log messages to a file,
-and optionally mirrors them to the console. A singleton pattern ensures
-that only one Logger instance (and one loaded config) exists per process,
-and that the runtime clock starts at the moment the very first Logger()
-call is made.
+The Logger reads its configuration from a YAML file, a mapping or a
+LoggerConfig, writes timestamped lines to a log file and optionally mirrors
+them to the console. One instance (and one configuration) exists per
+process; the runtime clock starts with the first Logger() call.
 """
 
 from __future__ import annotations
@@ -24,27 +22,23 @@ import threading
 import time
 import traceback
 
-# pandas is only needed for the type hint of printDataFrameRowCount(), which
-# itself only calls len(). Importing it for type checkers only keeps pandas
-# out of the runtime dependencies.
+# pandas is only needed for a type hint, so it stays out of the runtime
+# dependencies.
 if TYPE_CHECKING:
     import pandas   as pd
 
-# Key under which logger settings are expected to live in the YAML config file.
+# Key of the logger settings in the YAML config file.
 configuration_section: str = "logger"
 
-# Default path to the config file, used if no path is explicitly passed in.
+# Default config file, used if no config is passed in.
 standard_directory: str    = "./config/config.yaml"
 
-# Log levels mapped to their severity. A message is logged only if its
-# severity is at least that of the configured minimum level.
+# Severity per level; messages below the configured minimum are dropped.
 levels: dict[str, int]     = {"info": 0, "warning": 1, "error": 2}
 
-# Width of the level tag in each log line ("[INFO   ]", "[WARNING]"), so
-# that messages of all levels start in the same column.
+# Width of the level tag ("[INFO   ]"), so all messages start in one column.
 level_width: int           = max(len(level) for level in levels)
 
-# ANSI escape codes for the console colors that can be configured per level.
 ansi_colors: dict[str, str] = {
     "none"   : "",
     "black"  : "\033[30m",
@@ -57,31 +51,27 @@ ansi_colors: dict[str, str] = {
     "white"  : "\033[37m",
 }
 
-# ANSI escape code that resets the console color after a colored message.
 ansi_reset: str            = "\033[0m"
 
-# Everything Logger(config=...) accepts: a path to a YAML file, a mapping
-# such as a dict (the whole configuration or just the "logger" section), or
-# an already validated LoggerConfig.
+# Everything Logger(config=...) accepts: a YAML path, a mapping (whole
+# configuration or just the "logger" section) or a LoggerConfig.
 ConfigSource = Union[str, "os.PathLike[str]", Mapping[str, Any], LoggerConfig]
 
-# Levels of Python's standard logging module matching the Logger levels,
-# used by captureStandardLogging().
+# Standard logging levels matching the Logger levels (captureStandardLogging()).
 standard_levels: dict[str, int] = {
     "info"   : logging.INFO,
     "warning": logging.WARNING,
     "error"  : logging.ERROR,
 }
 
-# Warning logged once per stream when the console stops accepting output,
-# e.g. because the program's output was piped into `head`.
+# Logged once per stream when the console stops accepting output, e.g.
+# because the output was piped into `head`.
 console_closed_message: str = (
     "Console output to {stream} is closed (broken pipe); further messages "
     "for {stream} are only written to the log file."
 )
 
-# Minimum level printed to stderr instead of stdout, following the usual
-# convention that diagnostics go to stderr.
+# Minimum level printed to stderr instead of stdout.
 stderr_level: str = "warning"
 
 
@@ -89,152 +79,104 @@ class Logger:
     """
     Singleton logging utility.
 
-    Reads its configuration from a YAML file, a dict or a LoggerConfig
-    (validated via LoggerConfig) and writes timestamped log messages to a
-    file, optionally mirroring them to the console (stdout, or stderr for
-    warnings and errors). Because it's a singleton, only one instance (and
-    one loaded config) exists per process, and `start_time` is fixed at the
-    moment the first instance is created.
-
-    All public methods are thread-safe: lines written by different threads
-    are never interleaved, and multi-line output (headers, tracebacks) is
-    written as one block.
+    Writes timestamped log lines to a file and optionally to the console
+    (stdout, or stderr for warnings and errors). All public methods are
+    thread-safe: lines of different threads never interleave, and
+    multi-line output (headers, tracebacks) is written as one block.
 
     Class-level attributes
     ----------------------
     config : LoggerConfig or None
-        The validated configuration object shared by all callers. Set on
-        first instantiation, overwritten only if Logger() is called again
-        with an explicit config, and cleared by reset().
+        The configuration shared by all callers; cleared by reset().
     start_time : float
-        Monotonic clock value (time.monotonic()) recorded when the singleton
-        is first created. Used to compute elapsed runtime in log messages;
-        unaffected by system clock changes.
+        time.monotonic() at the creation of the singleton; the base of the
+        logged runtime.
     start_datetime : datetime or None
-        Wall-clock time recorded together with start_time. Fills the
-        {start} placeholder in `file_name`, so that all lines of a run go
-        to the same file.
+        Wall-clock time of the same moment; fills the {start} placeholder
+        in `file_name`, so all lines of a run go to the same file.
     _instance : Logger or None
         The single shared instance, managed by __new__.
     _lock : threading.RLock
-        Lock guarding singleton creation, configuration loading, writing
-        and the standard logging capture.
-        Replaced by a fresh lock in forked child processes.
+        Guards singleton creation, configuration, writing and the standard
+        logging capture. Replaced by a fresh lock in forked children.
     _closed_streams : set of str
-        Names of the console streams ("stdout", "stderr") that have stopped
-        accepting output (broken pipe); output to them is skipped from then
-        on.
+        Console streams ("stdout", "stderr") that hit a broken pipe and are
+        skipped from then on.
     _standard_handler, _standard_targets
         The handler installed by captureStandardLogging() and the standard
-        loggers it was added to; removed again by releaseStandardLogging().
+        loggers it was added to (with their previous levels).
     """
 
-    # Class-level attributes are intentional here: because Logger is a
-    # singleton, config and start_time must be shared across all references
-    # to the same instance. start_time is set once in __new__; config is set
-    # in __init__ on the first call and replaced whenever a config is passed
-    # explicitly. Both are always assigned on the class, never on the
-    # instance.
+    # Always assigned on the class, never on the instance, so that all
+    # references to the singleton share them.
     config    : LoggerConfig | None = None
     start_time: float               = 0.0
     start_datetime: dt | None       = None
     _instance : Logger | None       = None
 
-    # Re-entrant, because printHeader() holds the lock while calling log()
-    # three times, so that the header lines stay together, _logWith() logs
-    # the warning about a closed console stream while holding it, and
+    # Re-entrant, because printHeader() calls log() while holding it,
+    # _logWith() logs the closed-stream warning while holding it, and
     # reset() and captureStandardLogging() call releaseStandardLogging().
-    # (exception() needs no lock: it logs message and traceback as one
-    # entry.)
     _lock     : threading.RLock     = threading.RLock()
 
     _closed_streams: set[str]       = set()
 
-    # Handler installed by captureStandardLogging(), and the standard
-    # loggers it was added to, each with the level it had before.
     _standard_handler: StandardLoggingHandler | None    = None
     _standard_targets: list[tuple[logging.Logger, int]] = []
 
     def __new__(cls, *args, **kwargs):
         """
-        Ensure only one instance of Logger is ever created (singleton pattern).
-
-        Records the creation time on first instantiation only. On all
-        subsequent calls, the existing instance is returned unchanged so
-        that start_time is never reset mid-run. The lock ensures that two
-        threads calling Logger() at the same time get the same instance.
+        Return the single instance, creating it (and starting the runtime
+        clock) on the first call only.
         """
         with cls._lock:
             if cls._instance is None:
-                # No instance exists yet: create it and start the runtime clock.
                 cls._instance       = super().__new__(cls)
                 cls.start_time      = time.monotonic()
                 cls.start_datetime  = dt.now()
 
-        # On subsequent calls, return the existing instance instead of a new one.
         return cls._instance
 
     def __init__(self, config: ConfigSource | None = None, replace: bool = True):
         """
         Load and validate the logger configuration.
 
-        Note: __init__ runs every time Logger(...) is called, even though
-        __new__ returns the same singleton instance. The configuration is
-        therefore only (re)loaded when
-          - no configuration has been loaded yet (first call), or
-          - a config is passed explicitly.
-        A bare Logger() call after the first one keeps the current
-        configuration, so modules can fetch the singleton without knowing
-        which config the entry point used. Passing a config explicitly
-        reloads and overwrites the shared config — intentional, to allow
-        reconfiguration without restarting the process. Library code that
-        only wants to provide a fallback passes replace=False, so that it
-        never overrides the configuration of the entry point.
-
-        When a loaded configuration is replaced by a different one, a line
-        naming the changed settings is logged, so that the change is never
-        silent. If the log file changes, the line is written to the old
-        file as well, saying where further messages go.
+        __init__ runs on every Logger(...) call. A bare Logger() keeps the
+        current configuration, so modules can fetch the singleton without
+        knowing which config the entry point used; only the first call
+        falls back to ./config/config.yaml. An explicit config replaces the
+        current one, unless replace=False, which library code uses to
+        provide a fallback without overriding the entry point's config.
+        A replaced configuration is reported in the log (see
+        _logConfigChange()).
 
         Parameters
         ----------
         config : str, os.PathLike, Mapping, LoggerConfig or None, optional
             - Path to a YAML file; its "logger" section is loaded.
-            - A mapping such as a dict: either a whole configuration (the
-              parsed YAML file, with a "logger" key) or just the contents
-              of the "logger" section.
+            - A mapping such as a dict: either a whole configuration (with
+              a "logger" key) or just the contents of the "logger" section.
             - A LoggerConfig, used as is (a copy is stored).
-            - None: the current configuration is kept, or
-              ./config/config.yaml (relative to the working directory) is
-              loaded if none has been loaded yet.
+            - None: keep the current configuration, or load
+              ./config/config.yaml (relative to the working directory) if
+              none is loaded yet.
         replace : bool, optional
-            Whether `config` replaces a configuration that is already
-            loaded (default True). With False, `config` is only used if no
-            configuration has been loaded yet.
+            Whether `config` replaces an already loaded configuration
+            (default True). With False, it is only used if none is loaded.
         """
         with Logger._lock:
-            # Without an explicit config, keep the configuration that is
-            # already loaded; only the very first call falls back to the
-            # default path.
             if config is None:
                 if Logger.config is not None:
                     return
                 config = standard_directory
 
-            # A fallback configuration (replace=False) never overrides one
-            # that is already loaded.
             if not replace and Logger.config is not None:
                 return
 
             new = self._resolveConfig(config)
             old = Logger.config
-
-            # Stored on the class so that all references to the singleton
-            # share it.
             Logger.config = new
 
-            # Report a change of an already loaded configuration, so that a
-            # package reconfiguring the logger mid-run never goes unnoticed.
             if old is not None and old != new:
                 self._logConfigChange(old, new)
 
@@ -242,10 +184,9 @@ class Logger:
         """
         Log which settings changed when a configuration was replaced.
 
-        The line is logged with the new configuration. If the log file
-        changed, it is also written to the old file (file only), together
-        with the path of the new one, so that a reader of the old file
-        knows where the run continues.
+        If the log file changed, the line is also written to the old file,
+        with the path of the new one, so a reader knows where the run
+        continues.
         """
         old_values = old.model_dump()
         new_values = new.model_dump()
@@ -267,35 +208,28 @@ class Logger:
         """
         Turn any supported config source into a validated LoggerConfig.
 
-        Missing fields fall back to the model defaults, also when the
-        "logger" section is empty. Raises a KeyError if a YAML file is empty
-        or has no "logger" section, and a ValidationError if a value is
-        invalid or an unknown key is present (per the model's
-        ConfigDict(extra="forbid") setting).
+        Missing fields (or an empty "logger" section) fall back to the model
+        defaults. Raises a KeyError if a YAML file is empty or has no
+        "logger" section, and a ValidationError for invalid values or
+        unknown keys.
         """
-        # Copy a given LoggerConfig so later changes by the caller do not
-        # silently change the logger's configuration.
+        # Copied, so later changes by the caller do not change the logger.
         if isinstance(config, LoggerConfig):
             return config.model_copy(deep=True)
 
-        # A mapping is either a whole configuration (the parsed YAML file,
-        # with a "logger" key) or the contents of the "logger" section.
-        # "logger" is not a valid logger setting itself, so the two cannot
-        # be confused. An empty section ("logger:" with no keys) means "use
-        # all defaults". Mappings that are not dicts (e.g. OmegaConf configs)
-        # are converted first, since pydantic only validates dicts.
+        # "logger" is not a logger setting itself, so a whole configuration
+        # and a bare section cannot be confused. Mappings that are not dicts
+        # (e.g. OmegaConf configs) are converted, since pydantic only
+        # validates dicts.
         if isinstance(config, Mapping):
             config = Logger._toDict(config)
             if configuration_section in config:
                 return LoggerConfig.model_validate(config[configuration_section] or {})
             return LoggerConfig.model_validate(config)
 
-        # Otherwise it is a path: open and parse the YAML config file and
-        # validate its "logger" section.
         path = os.fspath(config)
         with open(path, "r", encoding="utf-8") as f:
-            # An empty file is parsed as None; treat it like a file without
-            # sections so the KeyError below explains what is missing.
+            # An empty file is parsed as None; the KeyError below explains it.
             data = yaml.safe_load(f) or {}
 
         if not isinstance(data, dict) or configuration_section not in data:
@@ -303,7 +237,6 @@ class Logger:
                 f"Config file '{path}' has no '{configuration_section}' section."
             )
 
-        # An empty section falls back to the defaults, as for a dict.
         return LoggerConfig.model_validate(data[configuration_section] or {})
 
     @staticmethod
@@ -318,10 +251,8 @@ class Logger:
         """
         Give a forked child process a fresh lock.
 
-        If another thread held the lock at the moment of the fork, the
-        child's copy stays locked forever, because that thread does not
-        exist in the child. Without this, the child's first log call would
-        hang. Registered via os.register_at_fork below.
+        A lock held by another thread at the moment of the fork would stay
+        locked forever in the child, and its first log call would hang.
         """
         cls._lock = threading.RLock()
 
@@ -331,10 +262,9 @@ class Logger:
         Discard the singleton, its configuration and its start time, and
         stop capturing standard logging (see releaseStandardLogging()).
 
-        The next Logger() call creates a fresh instance, loads the
-        configuration again and restarts the runtime clock. Mainly useful
-        in tests and notebooks. References to the old instance share the
-        class-level state, so they work again once Logger() has been called.
+        The next Logger() call starts afresh. Mainly useful in tests and
+        notebooks. Old references share the class-level state, so they work
+        again once Logger() has been called.
         """
         with cls._lock:
             cls.releaseStandardLogging()
@@ -347,13 +277,10 @@ class Logger:
     @staticmethod
     def _formatDuration(seconds: float, precise: bool = False) -> str:
         """
-        Format a duration in seconds as HH:MM:SS.
-
-        With `precise`, seconds are shown with two decimals (HH:MM:SS.ss),
-        so that short steps do not all show up as 00:00:00.
+        Format a duration in seconds as HH:MM:SS, or with `precise` as
+        HH:MM:SS.ss, so that short steps do not all show 00:00:00.
         """
-        # Count in whole hundredths (or whole seconds) before splitting, so
-        # that rounding carries over: 59.999 s is 00:01:00.00, not
+        # Round before splitting, so 59.999 s becomes 00:01:00.00, not
         # 00:00:60.00.
         unit           = 100 if precise else 1
         total          = round(seconds * 100) if precise else int(seconds)
@@ -368,9 +295,8 @@ class Logger:
 
     def _formatRuntime(self, config: LoggerConfig) -> str:
         """
-        Format the elapsed runtime since the singleton was created, in the
-        configured `runtime_format`: "3 Minutes" (or "1 Minute") or
-        "00:03:12".
+        Format the runtime since the singleton was created per
+        `runtime_format`: "3 Minutes" (or "1 Minute") or "00:03:12".
         """
         elapsed = time.monotonic() - self.start_time
 
@@ -383,14 +309,10 @@ class Logger:
     @staticmethod
     def _useColors(stream: Any = None) -> bool:
         """
-        Whether console output to `stream` (default stdout) may contain
-        color codes.
-
-        Only true if the stream is a terminal (not redirected to a file or
-        pipe) and the NO_COLOR environment variable (https://no-color.org)
-        is not set to a non-empty value; as the convention says, an empty
-        NO_COLOR is ignored. Some stream replacements (e.g. in notebooks)
-        lack isatty(), which is treated as "not a terminal".
+        Whether output to `stream` (default stdout) may contain color codes:
+        only if it is a terminal and NO_COLOR (https://no-color.org) is not
+        set to a non-empty value. Streams without isatty() (e.g. in
+        notebooks) count as no terminal.
         """
         stream = sys.stdout if stream is None else stream
         isatty = getattr(stream, "isatty", None)
@@ -407,11 +329,11 @@ class Logger:
 
     def _currentConfig(self) -> LoggerConfig:
         """
-        Return the loaded configuration, or explain why there is none.
+        Return the loaded configuration.
 
-        Each call of a logging method reads the configuration once through
-        this method, so that a line is never built from two configurations
-        if another thread reconfigures the logger meanwhile.
+        Each logging call reads it once through this method, so a line is
+        never built from two configurations if another thread reconfigures
+        the logger meanwhile.
 
         Raises
         ------
@@ -428,10 +350,7 @@ class Logger:
         return config
 
     def _logFilePath(self, config: LoggerConfig) -> str:
-        """
-        Path of the log file for `config`, with the {start} placeholder in
-        `file_name` filled in with the start of the run.
-        """
+        """Path of the log file for `config`, with {start} filled in."""
         file_name = config.file_name.format(start=Logger.start_datetime or dt.now())
         return os.path.join(config.folder, file_name)
 
@@ -451,31 +370,25 @@ class Logger:
 
     @staticmethod
     def _consoleStream(level: str) -> str:
-        """
-        Name of the console stream for `level`: "stderr" for warnings and
-        errors, "stdout" for everything else.
-        """
+        """Console stream for `level`: "stderr" for warnings and errors, else "stdout"."""
         return "stderr" if levels[level] >= levels[stderr_level] else "stdout"
 
     def _printToConsole(self, message: str, level: str, config: LoggerConfig) -> list[str]:
         """
-        Print `message` to the console stream for `level` without letting
+        Print `message` to the console stream for `level`, without letting
         the console break logging.
 
-        Warnings and errors go to stderr, everything else to stdout (see
-        _consoleStream()). Before writing to stderr, stdout is flushed, so
-        that lines keep their order when both streams go to the same file
-        (e.g. `python run.py > out.txt 2>&1`, where stdout is buffered but
-        stderr is not). Characters the console cannot encode are replaced
-        (e.g. by "?"), since the log file already has the full text. A
-        stream that is closed (broken pipe, e.g. when piped into `head`) is
+        stdout is flushed before writing to stderr, so lines keep their
+        order when both go to one file (`> out.txt 2>&1`, where stdout is
+        buffered but stderr is not). Unencodable characters are replaced,
+        since the log file has the full text. A stream with a broken pipe is
         skipped for the rest of the run.
 
         Returns
         -------
         list of str
-            Names of the streams that have just turned out to be closed, so
-            that the caller can log a warning about each.
+            Streams that have just turned out to be closed, so the caller
+            can log a warning about each.
         """
         name   = self._consoleStream(level)
         closed = []
@@ -510,12 +423,9 @@ class Logger:
         """
         Append `message` as one line to the file at `path`.
 
-        Opening in "a" (append) mode ensures that previous log entries are
-        never overwritten. The encoding is set explicitly so the output does
-        not depend on the system locale. The log folder is only created
-        when opening the file shows that it is missing (on the first line,
-        or if it was deleted during the run): checking it before every line
-        made log() about a third slower (about 12 instead of 8 µs per line).
+        The folder is only created when opening shows it is missing (first
+        line, or deleted during the run): checking it before every line made
+        log() about a third slower (12 instead of 8 µs per line).
         """
         try:
             log_file = open(path, mode="a", encoding=encoding)
@@ -535,21 +445,17 @@ class Logger:
         where the runtime part is only present if `log_runtime` is enabled.
         Messages below the configured minimum `level` are dropped. The line
         is written to the file first, then (if `cmdline` and the `console`
-        setting allow it) shown on the console in the color configured for
-        its level: on stdout for "info", on stderr for "warning" and
-        "error". Problems with the console (closed pipe, characters it
-        cannot encode) never stop the line from being written to the file;
-        a closed stream is reported once as a warning in the log file.
-
-        If `string` is None, the call is silently ignored — this allows
-        callers to pass through optional values without extra None checks.
-        An empty string is logged as a line without a message, which is
-        useful for adding blank separators to the log.
+        setting allow it) printed in the color of its level: "info" to
+        stdout, "warning" and "error" to stderr. Console problems never stop
+        the line from reaching the file; a closed stream is reported once
+        as a warning in the log file.
 
         Parameters
         ----------
         string : str, optional
-            The message to log. None is silently ignored.
+            The message to log. None is silently ignored, so callers can
+            pass optional values without a None check; "" logs a line
+            without a message (a blank separator).
         cmdline : bool, optional
             Whether to also print the message to the console (default True).
             Has no effect if the `console` setting is false.
@@ -568,12 +474,9 @@ class Logger:
                 f"Unknown log level '{level}', expected one of {list(levels)}"
             )
 
-        # Silently ignore None — allows callers to pass optional values
-        # without wrapping every call in a None check.
         if string is None:
             return
 
-        # Read the configuration once, so the whole line uses the same one.
         self._logWith(self._currentConfig(), string, cmdline, level)
 
     def _logWith(self, config: LoggerConfig, string: str, cmdline: bool, level: str) -> None:
@@ -581,41 +484,29 @@ class Logger:
         Write one log line using `config`; the implementation of log().
 
         Separate from log() so that a line can be written with a
-        configuration other than the current one (see _logConfigChange())
-        without changing the shared configuration in between.
+        configuration other than the current one (see _logConfigChange()).
         """
-        # Drop messages below the configured minimum level.
         if levels[level] < levels[config.level]:
             return
 
-        # Build the full path to the log file from the config.
         path = self._logFilePath(config)
 
-        # Start the log line with a timestamp, formatted per config, and the
-        # level tag padded to a fixed width.
         message = (
             f"[{dt.now().strftime(config.format)}] "
             f"[{level.upper():<{level_width}}] "
         )
 
-        # Optionally add the elapsed runtime since the Logger singleton was
-        # first created. Useful for tracking pipeline step durations without
-        # external profiling tools.
         if config.log_runtime:
             message = f"{message}({self._formatRuntime(config)}) "
 
-        # Append the actual log content after the prefix.
         message = f"{message}{string}"
 
         with Logger._lock:
-            # Append the message to the log file first, so that a console
-            # problem can never lose it.
+            # File first, so that a console problem can never lose the line.
             self._appendToFile(path, message, config.encoding)
 
-            # Mirror the message to the console if requested by the call and
-            # allowed by the `console` setting; only the console output is
-            # colored. If a console stream has just closed, say so in the
-            # log file (the lock is re-entrant).
+            # Report a console stream that has just closed in the log file
+            # (the lock is re-entrant).
             if cmdline and config.console:
                 for stream in self._printToConsole(message, level, config):
                     self._logWith(
@@ -637,11 +528,9 @@ class Logger:
     @staticmethod
     def _describeError(error: BaseException) -> str:
         """
-        Describe an exception on one line: "ValueError: bad row".
-
-        Without a message, only the type is given ("KeyboardInterrupt").
-        A message spanning several lines is joined with spaces, so that the
-        log line keeps the common one-line structure.
+        Describe an exception on one line: "ValueError: bad row", or just
+        the type without a message. Multi-line messages are joined with
+        spaces.
         """
         text = " ".join(line.strip() for line in str(error).splitlines() if line.strip())
         name = type(error).__name__
@@ -656,12 +545,10 @@ class Logger:
         """
         Log an error message followed by the traceback of an exception.
 
-        Call it inside an `except` block to log the exception currently
-        being handled, or pass the exception explicitly via `exc`. The
-        traceback lines follow the message line in the log file, without a
-        timestamp prefix of their own. If there is no exception, only the
-        message is logged; if there is neither, a note saying so is logged,
-        so that no empty error line is written.
+        Call it inside an `except` block, or pass the exception via `exc`.
+        The traceback lines follow the message line without a timestamp of
+        their own. Without an exception only the message is logged; without
+        either, a note saying so.
 
         Parameters
         ----------
@@ -676,15 +563,14 @@ class Logger:
         if exc is None:
             exc = sys.exc_info()[1]
 
-        # Format the full traceback, including chained exceptions, without
-        # the trailing newline (log() adds one).
+        # Includes chained exceptions; log() adds the final newline.
         trace = ""
         if exc is not None:
             trace = "".join(
                 traceback.format_exception(type(exc), exc, exc.__traceback__)
             ).rstrip("\n")
 
-        # Message and traceback form a single, multi-line log entry.
+        # One multi-line entry, so no lock is needed to keep it together.
         parts = [part for part in (string, trace) if part]
         if not parts:
             parts = ["exception() was called without a message or an active exception."]
@@ -701,9 +587,8 @@ class Logger:
 
         Logs "Step 'Loading SCT'..." on entry and
         "Step 'Loading SCT' completed in 00:01:23.45." on exit. If the block
-        raises, an error "Step 'Loading SCT' failed after 00:00:01.20
-        (ValueError: bad row)." is logged on one line (see _describeError())
-        and the exception is re-raised unchanged.
+        raises, the error "Step 'Loading SCT' failed after 00:00:01.20
+        (ValueError: bad row)." is logged and the exception is re-raised.
 
         Parameters
         ----------
@@ -739,12 +624,10 @@ class Logger:
         Write messages of Python's standard logging module to this log.
 
         Libraries such as torch, transformers or vLLM report through the
-        standard logging module, so their warnings would otherwise only
-        appear on stderr and never in the log file. After this call, their
-        records of at least `level` are logged here as
-        "<logger name>: <message>", with the matching Logger level and the
-        traceback of an exception, if any. The Logger's own minimum level
-        and `console` setting apply as usual.
+        standard logging module, so their warnings would otherwise never
+        reach the log file. Records of at least `level` are logged as
+        "<logger name>: <message>" with the matching level and traceback,
+        subject to the Logger's own minimum level and `console` setting.
 
         Calling it again replaces the previous capture. Undo it with
         releaseStandardLogging(); Logger.reset() does so as well.
@@ -753,18 +636,17 @@ class Logger:
         ----------
         level : str, optional
             Minimum level of the captured records: "info", "warning"
-            (default) or "error". If a standard logger would drop records
-            of this level, its level is lowered (and restored on release).
+            (default) or "error". A standard logger that would drop records
+            of this level is lowered (and restored on release).
         loggers : iterable of str or str, optional
             Names of the standard loggers to capture; the default "" is the
-            root logger, which receives the records of all loggers that
-            propagate to it. Add the names of loggers that do not propagate
-            (e.g. "vllm"), and consider cmdline=False for them, since they
-            print to the console themselves.
+            root logger, which receives the records of all propagating
+            loggers. Add loggers that do not propagate (e.g. "vllm"), and
+            consider cmdline=False for them, since they print themselves.
         cmdline : bool, optional
             Whether captured records are also printed to the console
             (default True). Without other handlers, the standard logging
-            module prints warnings to stderr only until this capture is
+            module stops printing warnings to stderr once this capture is
             installed, so they are not shown twice.
 
         Returns
@@ -782,8 +664,7 @@ class Logger:
                 f"Unknown log level '{level}', expected one of {list(standard_levels)}"
             )
 
-        # A single name is a common mistake for a list of names; iterating
-        # over it would capture the loggers "v", "l", "l", "m".
+        # Iterating over a single name would capture the loggers "v", "l", ...
         names = [loggers] if isinstance(loggers, str) else list(loggers)
 
         with Logger._lock:
@@ -796,8 +677,7 @@ class Logger:
                 target = logging.getLogger(name)
                 Logger._standard_targets.append((target, target.level))
                 target.addHandler(handler)
-                # Records below the logger's level are never created, so
-                # lower it if it would hide the requested level.
+                # Records below the logger's level are never created.
                 if target.getEffectiveLevel() > handler.level:
                     target.setLevel(handler.level)
 
@@ -808,10 +688,9 @@ class Logger:
     @classmethod
     def releaseStandardLogging(cls) -> None:
         """
-        Stop capturing standard logging (see captureStandardLogging()).
-
-        Removes the handler from the standard loggers and restores their
-        previous levels. Does nothing if nothing is captured.
+        Stop capturing standard logging (see captureStandardLogging()):
+        remove the handler and restore the previous logger levels. Does
+        nothing if nothing is captured.
         """
         with cls._lock:
             for target, previous_level in cls._standard_targets:
@@ -823,15 +702,10 @@ class Logger:
 
     def printHeader(self, text: str = "", cmdline: bool = True, level: str = "info") -> int:
         """
-        Log a formatted header block, optionally also printing it to the console.
-
-        The header consists of three lines:
-          1. A top border of `header_char` repeated `header_length` times.
-          2. A body line: `header_char`, the given text centered within
-             `header_length - 2` characters, then another `header_char`.
-             Text longer than `header_length - 2` is truncated so that
-             the body is always exactly as wide as the borders.
-          3. A bottom border identical to the top border.
+        Log a three-line header block: a border of `header_char` repeated
+        `header_length` times, the text centered between two `header_char`
+        (truncated to `header_length - 2` characters, so all lines are
+        equally wide), and the border again.
 
         Parameters
         ----------
@@ -840,28 +714,22 @@ class Logger:
         cmdline : bool, optional
             Whether to also print the header to the console (default True).
         level : str, optional
-            Level of the logged line(s): "info" (default), "warning" or
+            Level of the logged lines: "info" (default), "warning" or
             "error".
 
         Returns
         -------
         int
-            Combined character length of all three lines logged (excluding
-            timestamps and newlines).
+            Combined length of the three lines (without timestamps and
+            newlines), i.e. 3 * header_length.
         """
-        # Log the three lines in order: top border, body, bottom border.
-        # Holding the lock keeps the three lines together when several
-        # threads log at the same time, and keeps the configuration from
-        # changing in between.
+        # The lock keeps the three lines together and the configuration
+        # unchanged in between.
         with Logger._lock:
             config = self._currentConfig()
 
-            # Build the top/bottom border by repeating the header character.
             head_foot = config.header_char * config.header_length
 
-            # Build the body line: header character on each side, text
-            # truncated and centered within the remaining width so the body
-            # matches the border's total width.
             width = config.header_length - 2
             body  = (
                 f"{config.header_char}"
@@ -873,8 +741,6 @@ class Logger:
             self.log(body, cmdline, level)
             self.log(head_foot, cmdline, level)
 
-        # Return the combined character length of all three lines logged
-        # (always 3 * header_length, since the body is padded/truncated).
         return 2 * len(head_foot) + len(body)
 
     def _logFileEvent(
@@ -887,23 +753,12 @@ class Logger:
     ) -> int:
         """
         Log "<action> file '<name>'..." or "<action> file '<name>' completed.",
-        matching the wording of step(): a task is "<Task>..." when it starts and
-        "<Task> completed." when it is done.
+        matching the wording of step(). Shared by the printFileProcessing*,
+        printReadFile* and printWriteFile* helpers.
 
-        Shared implementation of the printFileProcessing*, printReadFile*
-        and printWriteFile* helpers. Only the last component of `file` is
-        logged — the directory path is stripped to keep messages concise
-        (a trailing separator is ignored, so "out/" logs "out").
-
-        Returns
-        -------
-        int
-            Length of the logged message string.
-
-        Raises
-        ------
-        ValueError
-            If `file` is empty, which would log the name ''.
+        Only the last component of `file` is logged (a trailing separator
+        is ignored, so "out/" logs "out"). Returns the message length and
+        raises a ValueError if `file` is empty.
         """
         path = os.fspath(file)
         if not path:
@@ -918,22 +773,19 @@ class Logger:
         self, file: str | os.PathLike[str], cmdline: bool = True, level: str = "info"
     ) -> int:
         """
-        Log the start of processing for a file.
+        Log "Processing file '<name>'...".
 
         Parameters
         ----------
         file : str or os.PathLike
-            Full or relative path to the file being processed.
-        cmdline : bool, optional
-            Whether to also print the message to the console (default True).
-        level : str, optional
-            Level of the logged line(s): "info" (default), "warning" or
-            "error".
+            Path to the file being processed; only its name is logged.
+        cmdline, level : optional
+            As in log().
 
         Returns
         -------
         int
-            Length of the logged message string.
+            Length of the logged message.
         """
         return self._logFileEvent("Processing", file, completed=False, cmdline=cmdline, level=level)
 
@@ -941,22 +793,9 @@ class Logger:
         self, file: str | os.PathLike[str], cmdline: bool = True, level: str = "info"
     ) -> int:
         """
-        Log the completion of processing for a file.
+        Log "Processing file '<name>' completed.".
 
-        Parameters
-        ----------
-        file : str or os.PathLike
-            Full or relative path to the file that was processed.
-        cmdline : bool, optional
-            Whether to also print the message to the console (default True).
-        level : str, optional
-            Level of the logged line(s): "info" (default), "warning" or
-            "error".
-
-        Returns
-        -------
-        int
-            Length of the logged message string.
+        Parameters and return value as in printFileProcessingStart().
         """
         return self._logFileEvent("Processing", file, completed=True, cmdline=cmdline, level=level)
 
@@ -966,24 +805,18 @@ class Logger:
         """
         Log the number of rows (items) of `data`: "Row count: 3.".
 
-        Works with anything that supports len(), e.g. a pandas DataFrame,
-        a list or a dict. If `data` is None, nothing is logged and 0 is
-        returned.
-
         Parameters
         ----------
         data : Sized or None, optional
-            The object whose length to log.
-        cmdline : bool, optional
-            Whether to also print the message to the console (default True).
-        level : str, optional
-            Level of the logged line(s): "info" (default), "warning" or
-            "error".
+            Anything supporting len(), e.g. a DataFrame, list or dict. If
+            None, nothing is logged.
+        cmdline, level : optional
+            As in log().
 
         Returns
         -------
         int
-            Length of the logged message string, or 0 if `data` is None.
+            Length of the logged message, or 0 if `data` is None.
         """
         ret = 0
 
@@ -997,33 +830,16 @@ class Logger:
     def printDataFrameRowCount(
         self, data: pd.DataFrame | None = None, cmdline: bool = True, level: str = "info"
     ) -> int:
-        """
-        Log the number of rows in a DataFrame. Same as printRowCount(),
-        which works with any object supporting len(); kept for existing
-        callers.
-        """
+        """Same as printRowCount(); kept for existing callers."""
         return self.printRowCount(data, cmdline, level)
 
     def printReadFileStart(
         self, file: str | os.PathLike[str], cmdline: bool = True, level: str = "info"
     ) -> int:
         """
-        Log the start of reading a file.
+        Log "Reading file '<name>'...".
 
-        Parameters
-        ----------
-        file : str or os.PathLike
-            Full or relative path to the file being read.
-        cmdline : bool, optional
-            Whether to also print the message to the console (default True).
-        level : str, optional
-            Level of the logged line(s): "info" (default), "warning" or
-            "error".
-
-        Returns
-        -------
-        int
-            Length of the logged message string.
+        Parameters and return value as in printFileProcessingStart().
         """
         return self._logFileEvent("Reading", file, completed=False, cmdline=cmdline, level=level)
 
@@ -1031,22 +847,9 @@ class Logger:
         self, file: str | os.PathLike[str], cmdline: bool = True, level: str = "info"
     ) -> int:
         """
-        Log the start of writing a file.
+        Log "Writing file '<name>'...".
 
-        Parameters
-        ----------
-        file : str or os.PathLike
-            Full or relative path to the file being written.
-        cmdline : bool, optional
-            Whether to also print the message to the console (default True).
-        level : str, optional
-            Level of the logged line(s): "info" (default), "warning" or
-            "error".
-
-        Returns
-        -------
-        int
-            Length of the logged message string.
+        Parameters and return value as in printFileProcessingStart().
         """
         return self._logFileEvent("Writing", file, completed=False, cmdline=cmdline, level=level)
 
@@ -1054,22 +857,9 @@ class Logger:
         self, file: str | os.PathLike[str], cmdline: bool = True, level: str = "info"
     ) -> int:
         """
-        Log the completion of reading a file.
+        Log "Reading file '<name>' completed.".
 
-        Parameters
-        ----------
-        file : str or os.PathLike
-            Full or relative path to the file that was read.
-        cmdline : bool, optional
-            Whether to also print the message to the console (default True).
-        level : str, optional
-            Level of the logged line(s): "info" (default), "warning" or
-            "error".
-
-        Returns
-        -------
-        int
-            Length of the logged message string.
+        Parameters and return value as in printFileProcessingStart().
         """
         return self._logFileEvent("Reading", file, completed=True, cmdline=cmdline, level=level)
 
@@ -1077,22 +867,9 @@ class Logger:
         self, file: str | os.PathLike[str], cmdline: bool = True, level: str = "info"
     ) -> int:
         """
-        Log the completion of writing a file.
+        Log "Writing file '<name>' completed.".
 
-        Parameters
-        ----------
-        file : str or os.PathLike
-            Full or relative path to the file that was written.
-        cmdline : bool, optional
-            Whether to also print the message to the console (default True).
-        level : str, optional
-            Level of the logged line(s): "info" (default), "warning" or
-            "error".
-
-        Returns
-        -------
-        int
-            Length of the logged message string.
+        Parameters and return value as in printFileProcessingStart().
         """
         return self._logFileEvent("Writing", file, completed=True, cmdline=cmdline, level=level)
 
@@ -1110,10 +887,9 @@ class StandardLoggingHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         """
-        Log `record` as "<logger name>: <message>" with the matching level:
-        DEBUG and INFO as "info", WARNING as "warning", ERROR and CRITICAL
-        as "error". The traceback of an attached exception follows on the
-        next lines, as with Logger.exception().
+        Log `record` as "<logger name>: <message>": DEBUG and INFO as
+        "info", WARNING as "warning", ERROR and CRITICAL as "error". An
+        attached exception's traceback follows, as with Logger.exception().
         """
         try:
             message = record.getMessage()
@@ -1133,13 +909,11 @@ class StandardLoggingHandler(logging.Handler):
             raise
         except Exception:
             # The standard way for handlers to report their own failures
-            # (prints "--- Logging error ---" to stderr) instead of raising
-            # into the code that logged the record.
+            # ("--- Logging error ---" on stderr) instead of raising.
             self.handleError(record)
 
 
-# Give forked child processes (e.g. multiprocessing workers started with
-# "fork") a fresh lock, see Logger._reinitLockAfterFork(). Not available on
-# Windows, which does not fork.
+# Fresh lock for forked children (e.g. multiprocessing "fork" workers), see
+# Logger._reinitLockAfterFork(). Windows does not fork.
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=Logger._reinitLockAfterFork)
