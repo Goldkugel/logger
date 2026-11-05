@@ -18,6 +18,7 @@ import yaml
 import logging
 import os
 import sys
+import textwrap
 import threading
 import time
 import traceback
@@ -526,14 +527,22 @@ class Logger:
         self.log(string, cmdline, level="error")
 
     @staticmethod
-    def _describeError(error: BaseException) -> str:
+    def _describeError(error: BaseException, width: int | None = None) -> str:
         """
         Describe an exception on one line: "ValueError: bad row", or just
         the type without a message. Multi-line messages are joined with
-        spaces.
+        spaces. With `width`, the description is cut at a word to about that
+        many characters, marked with " (...)"; a parenthesis the cut leaves
+        open is dropped with the rest.
         """
         text = " ".join(line.strip() for line in str(error).splitlines() if line.strip())
         name = type(error).__name__
+        if width is not None and text and len(name) + 2 + len(text) > width:
+            text = textwrap.shorten(text.rstrip("."), width=max(width - len(name) - 2 - 6, 10),
+                                    placeholder="")
+            if text.count("(") > text.count(")"):
+                text = text[:text.rindex("(")].rstrip()
+            text = f"{text.rstrip(' .,;:')} (...)"
         return f"{name}: {text}" if text else name
 
     def exception(
@@ -585,10 +594,10 @@ class Logger:
             with logger.step("Loading SCT"):
                 ...
 
-        Logs "Step 'Loading SCT'..." on entry and
-        "Step 'Loading SCT' completed in 00:01:23.45." on exit. If the block
-        raises, the error "Step 'Loading SCT' failed after 00:00:01.20
-        (ValueError: bad row)." is logged and the exception is re-raised.
+        Logs "Loading SCT..." on entry and "Loading SCT took 00:01:23.45." on
+        exit. If the block raises, the errors "Loading SCT failed after
+        00:00:01.20." and "Reason: ValueError: bad row." (cut to about 90
+        characters) are logged and the exception is re-raised.
 
         Parameters
         ----------
@@ -597,22 +606,19 @@ class Logger:
         cmdline : bool, optional
             Whether to also print the messages to the console (default True).
         """
-        self.log(f"Step '{name}'...", cmdline)
+        self.log(f"{name}...", cmdline)
         start = time.monotonic()
 
         try:
             yield
         except BaseException as e:
             duration = self._formatDuration(time.monotonic() - start, precise=True)
-            self.log(
-                f"Step '{name}' failed after {duration} ({self._describeError(e)}).",
-                cmdline,
-                level="error",
-            )
+            self.log(f"{name} failed after {duration}.", cmdline, level="error")
+            self.log(f"Reason: {self._describeError(e, width=90)}.", cmdline, level="error")
             raise
 
         duration = self._formatDuration(time.monotonic() - start, precise=True)
-        self.log(f"Step '{name}' completed in {duration}.", cmdline)
+        self.log(f"{name} took {duration}.", cmdline)
 
     def captureStandardLogging(
         self,

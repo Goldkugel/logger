@@ -511,8 +511,8 @@ class TestLog:
         """
         Every message the logger writes itself is one line of the form
         [<timestamp>] [<LEVEL>] (<runtime>) <sentence ending in ".">, or
-        <task>... when a task starts, followed by "<task> completed" (or
-        "failed") when it ends.
+        <task>... when a task starts, followed by "<task> completed", "<task>
+        took <duration>" (a step) or "<task> failed" when it ends.
         (Header lines and exception() tracebacks are tested separately.)
         """
         logger, lines = make_logger(log_runtime=True)
@@ -535,14 +535,15 @@ class TestLog:
             r"[A-Za-z(][^\n]*[^.](\.|\.\.\.)\n$"
         )
         content = lines()
-        assert len(content) == 14
+        assert len(content) == 16
         for line in content:
             assert pattern.match(line), line
         messages = [line.split(") ", 1)[1].rstrip("\n") for line in content]
         for index, message in enumerate(messages):
             if message.endswith("..."):
                 task = message[:-3]
-                assert messages[index + 1].startswith((f"{task} completed", f"{task} failed")), message
+                assert messages[index + 1].startswith(
+                    (f"{task} completed", f"{task} took", f"{task} failed")), message
 
 
 # --------------------------------------------------------------------------
@@ -1169,17 +1170,17 @@ class TestStep:
         logger, lines = make_logger()
         with logger.step("Loading", cmdline=False):
             pass
-        assert "Step 'Loading'..." in lines()[0]
-        assert "[INFO   ] Step 'Loading' completed in 00:00:0" in lines()[1]
+        assert "Loading..." in lines()[0]
+        assert "[INFO   ] Loading took 00:00:0" in lines()[1]
 
     def test_failure_is_logged_and_reraised(self, make_logger):
         logger, lines = make_logger()
         with pytest.raises(ValueError):
             with logger.step("Parsing", cmdline=False):
                 raise ValueError("bad row")
-        assert len(lines()) == 2
-        assert "[ERROR  ] Step 'Parsing' failed after" in lines()[1]
-        assert "(ValueError: bad row)" in lines()[1]
+        assert len(lines()) == 3
+        assert "[ERROR  ] Parsing failed after" in lines()[1]
+        assert lines()[2].endswith("[ERROR  ] Reason: ValueError: bad row.\n")
 
     def test_measures_duration(self, make_logger, monkeypatch):
         logger, lines = make_logger()
@@ -1190,7 +1191,7 @@ class TestStep:
         monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: next(clock)))
         with logger.step("Embedding", cmdline=False):
             pass
-        assert "completed in 00:01:05.50." in lines()[1]
+        assert "Embedding took 00:01:05.50." in lines()[1]
 
 
     def test_multi_line_error_stays_on_one_line(self, make_logger):
@@ -1198,13 +1199,22 @@ class TestStep:
         with pytest.raises(ValueError):
             with logger.step("Parsing", cmdline=False):
                 raise ValueError("bad row\n  in line 12")
-        assert len(lines()) == 2
-        assert lines()[1].endswith("(ValueError: bad row in line 12).\n")
+        assert len(lines()) == 3
+        assert lines()[2].endswith("Reason: ValueError: bad row in line 12.\n")
 
     def test_describe_error(self):
         assert Logger._describeError(KeyError("HP:1"))     == "KeyError: 'HP:1'"
         assert Logger._describeError(ValueError(""))       == "ValueError"
         assert Logger._describeError(ValueError("a\n\nb")) == "ValueError: a b"
+
+    def test_describe_error_cuts_long_messages_outside_parentheses(self):
+        long = ValueError("The cached snapshot for 'org/model' (revision 'main') is incomplete "
+                          "and misses several files that the model needs to be loaded.")
+        described = Logger._describeError(long, width=60)
+        assert len(described) <= 60
+        assert described.endswith(" (...)")
+        assert described.count("(") == described.count(")")
+        assert Logger._describeError(ValueError("short"), width=60) == "ValueError: short"
 
     def test_keyboard_interrupt_is_logged_and_reraised(self, make_logger):
         """BaseExceptions such as KeyboardInterrupt are logged as failures too."""
@@ -1212,16 +1222,16 @@ class TestStep:
         with pytest.raises(KeyboardInterrupt):
             with logger.step("Waiting", cmdline=False):
                 raise KeyboardInterrupt
-        assert "Step 'Waiting' failed after" in lines()[1]
-        assert lines()[1].endswith("(KeyboardInterrupt).\n")
+        assert "Waiting failed after" in lines()[1]
+        assert lines()[2].endswith("Reason: KeyboardInterrupt.\n")
 
     def test_prints_to_console(self, make_logger, capsys):
         logger, _ = make_logger()
         with logger.step("Loading"):
             pass
         out = capsys.readouterr().out
-        assert "Step 'Loading'..." in out
-        assert "Step 'Loading' completed in" in out
+        assert "Loading..." in out
+        assert "Loading took" in out
 
     def test_minimum_level_hides_progress_but_not_failure(self, make_logger):
         logger, lines = make_logger(level="error")
@@ -1230,8 +1240,9 @@ class TestStep:
         with pytest.raises(ValueError):
             with logger.step("Broken", cmdline=False):
                 raise ValueError("bad row")
-        assert len(lines()) == 1
-        assert "Step 'Broken' failed after" in lines()[0]
+        assert len(lines()) == 2
+        assert "Broken failed after" in lines()[0]
+        assert "Reason: ValueError: bad row." in lines()[1]
 
 
 # --------------------------------------------------------------------------
@@ -1320,8 +1331,8 @@ class TestConsoleStreams:
             with logger.step("Parsing"):
                 raise ValueError("bad row")
         captured = capsys.readouterr()
-        assert "Step 'Parsing'..." in captured.out
-        assert "Step 'Parsing' failed after" in captured.err
+        assert "Parsing..." in captured.out
+        assert "Parsing failed after" in captured.err
 
     def test_stdout_is_flushed_before_stderr(self, make_logger, monkeypatch):
         """Keeps the order of lines when both streams go to one file."""
