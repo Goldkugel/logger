@@ -11,9 +11,10 @@ A lightweight, singleton-based logging utility for Python projects that writes t
 - **Log levels with colors** — `info`, `warning` and `error` messages, a configurable minimum level, and a configurable console color per level (white, yellow and red by default).
 - **Optional runtime tracking** — add the elapsed time since the logger started to each log entry, in minutes or as `HH:MM:SS`.
 - **Step timing** — `with logger.step("..."):` logs the start, end and exact duration of a block.
-- **Exception logging** — `logger.exception(...)` writes the full traceback to the log file.
+- **Progress tracking** — `with logger.progress("...", total=n) as p:` with `p.update(k)` in the loop logs how many items are done, the percentage, the elapsed and the estimated remaining time, every N items or seconds.
+- **Exception logging** — `logger.exception(...)` writes the full traceback to the log file, and `captureUncaughtExceptions()` does so for a crash nothing catches, so the log file of a failed batch job says why it ended.
 - **Thread-safe** — lines from different threads are never interleaved.
-- **Standard logging capture** — `captureStandardLogging()` writes warnings of libraries that use Python's `logging` module (torch, transformers, vLLM, ...) to the same log file.
+- **Standard logging capture** — `captureStandardLogging()` writes warnings of libraries that use Python's `logging` module (torch, transformers, vLLM, ...) and Python warnings (`warnings.warn()`, used e.g. by numpy, pandas or UMAP) to the same log file.
 - **No silent reconfiguration** — library code can pass its config with `replace=False`, and every change of a loaded configuration is logged.
 - **Formatted headers** — print a bordered header block to visually separate sections in the log.
 - **Convenience helpers** — pre-built methods for common logging patterns (file processing, reading, writing, DataFrame row counts).
@@ -75,6 +76,12 @@ logger.error("Could not reach the terminology server.")
 # Time a step: logs its start, end and duration (and a failure, if any)
 with logger.step("Loading SNOMED CT"):
     ...
+
+# Like step(), plus progress lines with the estimated remaining time
+with logger.progress("Encoding terms", total=len(terms), every=10000) as progress:
+    for chunk in chunks:
+        ...
+        progress.update(len(chunk))
 
 # Log an exception with its traceback
 try:
@@ -144,7 +151,31 @@ logger.captureStandardLogging(level="info")        # also info records
 logger.captureStandardLogging(loggers=["", "vllm"], cmdline=False)  # add a logger that does not propagate
 ```
 
-Captured records appear as `<logger name>: <message>` with the matching level, e.g. `[WARNING] transformers.modeling_utils: Some weights were not initialized.` The Logger's own `level` and `console` settings apply as usual. `Logger.releaseStandardLogging()` (or `Logger.reset()`) undoes the capture and restores the levels of the standard loggers.
+Captured records appear as `<logger name>: <message>` with the matching level, e.g. `[WARNING] transformers.modeling_utils: Some weights were not initialized.` Python warnings are captured as well, as `[WARNING] UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism. (umap_.py:1952)`; Python shows each warning only once per code location by default, so a loop does not repeat it. Pass `warnings=False` to leave them out; with `level="error"` they are not captured either. The Logger's own `level` and `console` settings apply as usual. `Logger.releaseStandardLogging()` (or `Logger.reset()`) undoes the capture and restores the levels of the standard loggers and Python's own display of warnings.
+
+### Logging crashes
+
+An exception that nothing catches ends the program, and its traceback normally only goes to stderr. To also write it to the log file:
+
+```python
+logger = Logger(config="./config/config.yaml")
+logger.captureUncaughtExceptions()
+```
+
+A crash is then logged as `[ERROR  ] Run failed after 00:03:12.84 with an uncaught exception.`, followed by the traceback, and an exception that ends a thread as `Thread '<name>' failed with an uncaught exception.`. Ctrl+C gives the warning `Run interrupted after 00:03:12.84.` without a traceback. Python still prints the traceback to stderr afterwards, so the lines are only written to the log file unless `cmdline=True` is passed. A job killed by a signal, e.g. by Slurm at its time limit, raises no exception and is therefore not logged. `Logger.releaseUncaughtExceptions()` (or `Logger.reset()`) restores Python's previous handling.
+
+### Progress of long loops
+
+`progress()` works like `step()` and additionally logs the progress whenever `every` more items are done, `seconds` (default 60) have passed since the last progress line, or `total` is reached:
+
+```
+[2026-11-05 10:32:01] [INFO   ] Encoding terms...
+[2026-11-05 10:33:03] [INFO   ] Encoding terms: 10000/50000 (20.0%), elapsed 00:01:02, remaining ~00:04:08.
+[2026-11-05 10:37:11] [INFO   ] Encoding terms: 50000/50000 (100.0%), elapsed 00:05:10.
+[2026-11-05 10:37:11] [INFO   ] Encoding terms took 00:05:10.20.
+```
+
+The remaining time is estimated from the average time per item so far. Without `total`, the lines read `Encoding terms: 10000 done, elapsed 00:01:02.`. Progress that has not been logged yet is logged when the block ends, also when it fails (followed by the failure lines of `step()`). `update()` is thread-safe; the time interval is only checked when `update()` is called.
 
 A log file then looks like this:
 
@@ -159,15 +190,18 @@ A log file then looks like this:
 | Method | Description | Returns |
 |---|---|---|
 | `Logger(config=None, replace=True)` | Returns the singleton. `config` may be a YAML path, a mapping such as a dict (the whole configuration or just the `logger` section) or a `LoggerConfig`; `None` keeps the loaded configuration. With `replace=False`, `config` is only used if no configuration is loaded yet. A change of a loaded configuration is logged. | `Logger` |
-| `Logger.reset()` | Discards the singleton, its configuration and start time, and stops capturing standard logging. References kept from before raise a `RuntimeError` until `Logger()` is called again. | `None` |
-| `captureStandardLogging(level="warning", loggers=("",), cmdline=True)` | Writes records of Python's `logging` module of at least `level` to this log, from the root logger (`""`) and any other named loggers. Calling it again replaces the previous capture. | `logging.Handler` |
-| `Logger.releaseStandardLogging()` | Stops capturing standard logging and restores the levels of the standard loggers. | `None` |
+| `Logger.reset()` | Discards the singleton, its configuration and start time, and stops capturing standard logging, Python warnings and uncaught exceptions. References kept from before raise a `RuntimeError` until `Logger()` is called again. | `None` |
+| `captureStandardLogging(level="warning", loggers=("",), cmdline=True, warnings=True)` | Writes records of Python's `logging` module of at least `level` to this log, from the root logger (`""`) and any other named loggers, and with `warnings` (unless `level="error"`) Python warnings too. Calling it again replaces the previous capture. | `logging.Handler` |
+| `Logger.releaseStandardLogging()` | Stops capturing standard logging and Python warnings, and restores the levels of the standard loggers and Python's display of warnings. | `None` |
 | `log(string, cmdline=True, level="info")` | Writes a timestamped message to the log file; optionally prints to console. `None` is ignored; messages below the configured `level` are dropped. | `None` |
 | `info(string, cmdline=True)` | Same as `log(..., level="info")`. | `None` |
 | `warning(string, cmdline=True)` | Same as `log(..., level="warning")`. | `None` |
 | `error(string, cmdline=True)` | Same as `log(..., level="error")`. | `None` |
 | `exception(string="", exc=None, cmdline=True)` | Logs an error with the traceback of `exc`, or of the exception currently being handled. | `None` |
 | `step(name, cmdline=True)` | Context manager logging the start, end and duration of a block; logs an error and re-raises if the block fails. | context manager |
+| `progress(name, total=None, every=None, seconds=60.0, cmdline=True)` | Like `step()`, and yields a `Progress` whose `update(n=1)` logs the number of items done, the percentage, the elapsed and the remaining time every `every` items, at most `seconds` after the last line, and when `total` is reached. `done` and `total` can be read. | context manager yielding `Progress` |
+| `captureUncaughtExceptions(cmdline=False)` | Writes exceptions that end the program or a thread to this log, with their traceback, before Python's own handling. Calling it again replaces the previous capture. | `None` |
+| `Logger.releaseUncaughtExceptions()` | Stops capturing uncaught exceptions and restores Python's previous handling. | `None` |
 | `printHeader(text, cmdline=True, level="info")` | Logs a bordered header block containing `text`. | `int` — combined length of header lines |
 | `printFileProcessingStart(file, cmdline=True, level="info")` | Logs the start of processing for `file` (a path or `os.PathLike`; only its last component is logged, and an empty name raises a `ValueError`). | `int` — message length |
 | `printFileProcessingEnd(file, cmdline=True, level="info")` | Logs completion of processing for `file`. | `int` — message length |
@@ -181,12 +215,12 @@ A log file then looks like this:
 
 ### File helpers
 
-For runs that share files, e.g. the jobs of a Slurm job array. They need only the standard library and are imported from the package itself (`from logger import lockedFile, writeJSON`).
+For runs that share files, e.g. the jobs of a Slurm job array. They need only the standard library, accept paths as `str` or `pathlib.Path`, and are imported from the package itself (`from logger import lockedFile, writeJSON`).
 
 | Function | Description | Returns |
 |---|---|---|
-| `lockedFile(path)` | Context manager holding an exclusive lock on `<path>.lock` while the block runs, so processes updating `path` take turns. Where file locks are not supported (Windows, or a file system without lock support), this is logged and the block runs without a lock. | context manager |
-| `writeAtomically(path, write)` | Calls `write(tmp_path)` to write `<path>.tmp`, which then replaces `path` in one operation, so an interrupted write never leaves a partial file. The temporary file is removed if writing fails. | `None` |
+| `lockedFile(path)` | Context manager holding an exclusive lock on `<path>.lock` while the block runs, so processes updating `path` take turns. Where file locks are not supported (Windows, or a file system without lock support), a warning is logged and the block runs without a lock. | context manager |
+| `writeAtomically(path, write)` | Calls `write(tmp_path)` to write a temporary file next to `path` (`<path>.<process>-<thread>.tmp`, so two writers never share one), which then replaces `path` in one operation, so an interrupted write never leaves a partial file. The temporary file is removed if writing fails. | `None` |
 | `writeJSON(data, path)` | Writes `data` as indented UTF-8 JSON with `writeAtomically()`. | `None` |
 | `makeParentFolder(path)` | Creates the folder of the file at `path` if needed. | `None` |
 
@@ -203,13 +237,14 @@ with lockedFile("./data/output/runs.json"):
 - **Console streams**: info messages go to stdout, warnings and errors (including tracebacks) to stderr. Before a line is written to stderr, stdout is flushed, so that lines keep their order when both streams go to the same file (`python run.py > out.txt 2>&1`).
 - **Colors**: only console output is colored, and only when the stream it goes to is a terminal and `NO_COLOR` is not set to a non-empty value; the log file never contains color codes. In notebooks, output is therefore not colored.
 - **Threads and processes**: logging from several threads is safe. `multiprocessing` workers depend on the start method: with `fork` (the Linux default before Python 3.14) a worker inherits the parent's configuration and runtime clock, and gets a fresh lock, so it does not hang if another thread was logging at the moment of the fork; with `spawn` or `forkserver` (the default on macOS and Windows, and on Linux from Python 3.14) it starts without a `Logger`, so a bare `Logger()` loads `./config/config.yaml` and starts a new runtime clock — pass the configuration to the worker if it differs. Lines from several processes go to the same file in the order they are written, without coordination between the processes.
-- **Console problems**: each line is written to the log file before it is printed, so console problems never lose it. Characters the console cannot encode are replaced on the console only (e.g. by `?`). If stdout or stderr stops accepting output, e.g. because the output was piped into `head`, output to that stream is switched off for the rest of the run and a warning is written to the log file; Python may still report the closed pipe on stderr when the program exits.
+- **Console problems**: each line is written to the log file before it is printed, so console problems never lose it. Characters the console cannot encode are replaced on the console only (e.g. by `?`). If stdout or stderr stops accepting output, e.g. because the output was piped into `head`, the terminal of an SSH session is gone or the stream was closed, output to that stream is switched off for the rest of the run and a warning with the reason is written to the log file, so the run goes on; Python may still report a closed pipe on stderr when the program exits.
 - **Log folder**: the folder configured in `folder` is created automatically on the first `log()` call, and again if it is deleted during the run.
 - **One file per run**: `{start}` in `file_name` is the moment the `Logger` singleton was first created, so all lines of a run go to the same file, also when the configuration is reloaded. `Logger.reset()` starts a new file. Two runs started within the same second share a file unless the format includes `%f` (microseconds). `multiprocessing` workers started with `spawn` or `forkserver` create their own `Logger` and therefore their own file. Use `Logger().logFilePath()` to find the file of the current run.
 - **Console output**: `console: false` keeps all messages in the log file only, whatever `cmdline` the calls pass, e.g. for batch jobs whose stdout is saved anyway.
 - **Encoding**: the log file is written with the configured `encoding` (default UTF-8), independent of the system locale.
-- **Message format**: the messages the logger writes itself are one sentence each, e.g. `Loading...`, `Loading took 00:00:01.20.`, `Reading file 'hp.obo' completed.` or `Row count: 3.` A task is logged as `<Task>...` when it starts and as `<Task> completed.` (for a step: `<Task> took <duration>.`) as soon as it is done; its results are logged in between. A step failure gives `<Task> failed after <duration>.` and the error on a row of its own (`Reason: ValueError: bad row.`, cut to about 90 characters); `exception()` adds the full traceback on the following lines.
+- **Message format**: the messages the logger writes itself are one sentence each, e.g. `Loading...`, `Loading took 00:00:01.20.`, `Reading file 'hp.obo' completed.` or `Row count: 3.` A task is logged as `<Task>...` when it starts and as `<Task> completed.` (for a step: `<Task> took <duration>.`) as soon as it is done; its results are logged in between. A step failure gives `<Task> failed after <duration>.` and the error on a row of its own (`Reason: ValueError: bad row.`, cut to about 90 characters); `exception()` adds the full traceback on the following lines. A progress line reads `<Task>: <done>/<total> (<percent>%), elapsed <time>, remaining ~<time>.`.
 - **Header width**: `printHeader` centers `text` within `header_length - 2` characters; longer text is truncated so the header always has the configured width.
+- **Long messages**: a message longer than `header_length` is split over several lines, each with timestamp and level: at the last space or tab within `header_length` characters (the space is dropped), or after exactly `header_length` characters if there is none. Only the first line of an entry is split; the lines of a traceback stay as they are.
 
 ## Tests
 

@@ -1,9 +1,10 @@
 """
 Test suite for the Logger class and LoggerConfig model: singleton, config
 loading and sources, log(), printHeader(), the file and row count helpers,
-levels and colors, runtime formats, exception() and step(), thread safety,
-multiprocessing, console streams and problems, the {start} placeholder,
-reconfiguration and the standard logging capture. The file helpers are
+levels and colors, runtime formats, exception(), step() and progress(),
+thread safety, multiprocessing, console streams and problems, the {start}
+placeholder, reconfiguration, the standard logging and Python warnings
+capture and the capture of uncaught exceptions. The file helpers are
 tested in tests/FileUtilsTest.py.
 
 Run with `pytest -v` from the repository root, so that the real
@@ -20,6 +21,7 @@ import re
 import sys
 import threading
 import time
+import warnings
 
 from datetime import datetime
 from types import MappingProxyType, SimpleNamespace
@@ -31,7 +33,7 @@ import yaml
 from pydantic import ValidationError
 
 import logger as logger_package
-from logger import LevelColors, Logger, LoggerConfig
+from logger import LevelColors, Logger, LoggerConfig, Progress
 
 
 # --------------------------------------------------------------------------
@@ -280,6 +282,13 @@ class TestConfigLoading:
         config_path.write_text("logger:\n")
         logger = Logger(config=str(config_path))
         assert logger.config == LoggerConfig()
+
+    def test_empty_colors_section_uses_defaults(self, tmp_path):
+        """An empty "colors:" subsection works like an empty "logger:" section."""
+        config_path = tmp_path / "empty_colors.yaml"
+        config_path.write_text("logger:\n  colors:\n")
+        logger = Logger(config=str(config_path))
+        assert logger.config.colors == LevelColors()
 
 
     def test_non_mapping_yaml_raises(self, tmp_path):
@@ -905,7 +914,8 @@ def make_logger(tmp_path):
     lines of its log file. Used throughout this file.
     """
     def factory(**overrides):
-        config = {"folder": str(tmp_path), **overrides}
+        # Wide, so messages stay on one line unless a test sets header_length.
+        config = {"folder": str(tmp_path), "header_length": 200, **overrides}
         logger = Logger(config=config)
         return logger, lambda: read_log_lines(config["folder"], logger.config.file_name)
     return factory
@@ -1063,7 +1073,7 @@ class TestRuntimeFormat:
         """Later Logger() calls with a new config do not restart the clock."""
         logger, lines = make_logger(log_runtime=True)
         Logger.start_time = time.monotonic() - 180
-        Logger(config={"folder": logger.config.folder, "log_runtime": True})
+        Logger(config={"folder": logger.config.folder, "log_runtime": True, "header_length": 200})
         logger.log("x", cmdline=False)
         assert "(3 Minutes) x" in lines()[0]
 
@@ -1234,6 +1244,193 @@ class TestStep:
         assert "Reason: ValueError: bad row." in lines()[1]
 
 
+@pytest.fixture
+def clock(monkeypatch):
+    """
+    Replace the clock seen by the Logger module only. Returns a list whose
+    only item is the current time; tests advance it by assigning to [0].
+    """
+    now = [100.0]
+    module = sys.modules["logger.Logger"]
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    return now
+
+
+class TestProgress:
+    """Tests for the Logger.progress() context manager and Progress."""
+
+    def test_logs_start_progress_and_duration(self, make_logger, clock):
+        logger, lines = make_logger()
+        with logger.progress("Encoding", total=4, every=2, cmdline=False) as p:
+            assert isinstance(p, Progress)
+            for _ in range(4):
+                clock[0] += 15
+                p.update()
+        content = [line.split("] ", 2)[2].rstrip("\n") for line in lines()]
+        assert content == [
+            "Encoding...",
+            "Encoding: 2/4 (50.0%), elapsed 00:00:30, remaining ~00:00:30.",
+            "Encoding: 4/4 (100.0%), elapsed 00:01:00.",
+            "Encoding took 00:01:00.00.",
+        ]
+
+    def test_time_interval(self, make_logger, clock):
+        logger, lines = make_logger()
+        with logger.progress("Matching", total=100, seconds=60, cmdline=False) as p:
+            for _ in range(5):
+                clock[0] += 25
+                p.update(10)
+        progress = [line for line in lines() if "Matching: " in line]
+        # Due 60 s after the last line: at 75 s and at 150 s; the rest on exit.
+        assert [line.split("Matching: ")[1].split(" ")[0] for line in progress] == [
+            "30/100", "50/100"
+        ]
+        assert "remaining ~00:02:55" in progress[0]
+
+    def test_total_reached_is_always_logged(self, make_logger):
+        logger, lines = make_logger()
+        with logger.progress("Copying", total=3, seconds=None, cmdline=False) as p:
+            p.update(3)
+            assert any("Copying: 3/3 (100.0%)" in line for line in lines())
+        # Logged once, not again on exit.
+        assert sum("Copying: " in line for line in lines()) == 1
+
+    def test_unknown_total(self, make_logger, clock):
+        logger, lines = make_logger()
+        with logger.progress("Reading", every=5, cmdline=False) as p:
+            clock[0] += 3
+            p.update(7)
+        assert lines()[1].rstrip("\n").endswith("Reading: 7 done, elapsed 00:00:03.")
+
+    def test_unlogged_progress_is_logged_on_exit(self, make_logger):
+        logger, lines = make_logger()
+        with logger.progress("Parsing", total=10, cmdline=False) as p:
+            p.update(4)
+        assert "Parsing: 4/10 (40.0%)" in lines()[1]
+        assert "Parsing took" in lines()[2]
+
+    def test_nothing_done_logs_no_progress_line(self, make_logger):
+        logger, lines = make_logger()
+        with logger.progress("Idle", total=10, cmdline=False):
+            pass
+        assert len(lines()) == 2
+
+    def test_failure_logs_progress_then_failure(self, make_logger):
+        logger, lines = make_logger()
+        with pytest.raises(ValueError):
+            with logger.progress("Parsing", total=10, cmdline=False) as p:
+                p.update(6)
+                raise ValueError("bad row")
+        assert "Parsing: 6/10 (60.0%)" in lines()[1]
+        assert "[ERROR  ] Parsing failed after" in lines()[2]
+        assert lines()[3].endswith("Reason: ValueError: bad row.\n")
+
+    def test_empty_total(self, make_logger):
+        logger, lines = make_logger()
+        with logger.progress("Nothing", total=0, cmdline=False) as p:
+            p.update(0)
+        assert len(lines()) == 2
+
+    @pytest.mark.parametrize(
+        "arguments", [{"total": -1}, {"every": 0}, {"seconds": 0}, {"seconds": -5.0}]
+    )
+    def test_invalid_arguments_raise(self, make_logger, arguments):
+        logger, lines = make_logger()
+        with pytest.raises(ValueError):
+            with logger.progress("Bad", **arguments):
+                pass
+        assert lines() == []
+
+    def test_updates_from_threads_are_counted(self, make_logger):
+        logger, lines = make_logger()
+        with logger.progress("Parallel", total=800, every=100, cmdline=False) as p:
+            def work():
+                for _ in range(100):
+                    p.update()
+            threads = [threading.Thread(target=work) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            assert p.done == 800
+        assert sum("Parallel: " in line for line in lines()) == 8
+
+    def test_prints_to_console(self, make_logger, capsys):
+        logger, _ = make_logger()
+        with logger.progress("Loading", total=1) as p:
+            p.update()
+        assert "Loading: 1/1 (100.0%)" in capsys.readouterr().out
+
+
+class TestLineSplitting:
+    """Tests that messages longer than header_length are split over several lines."""
+
+    @staticmethod
+    def _messages(lines):
+        """The message part of each line, after the timestamp and level."""
+        return [line.split("] ", 2)[2].rstrip("\n") for line in lines]
+
+    def test_splits_at_the_last_space_within_the_width(self, make_logger):
+        logger, lines = make_logger(header_length=20)
+        logger.log("Loading the ontology took longer than expected", cmdline=False)
+        assert self._messages(lines()) == ["Loading the ontology", "took longer than", "expected"]
+
+    def test_every_part_has_timestamp_and_level(self, make_logger):
+        logger, lines = make_logger(header_length=10, log_runtime=True)
+        logger.warning("first second third", cmdline=False)
+        assert len(lines()) == 3
+        assert all(re.match(r"\[[^]]+\] \[WARNING\] \(0 Minutes\) \S", line) for line in lines())
+
+    def test_splits_at_the_width_without_whitespace(self, make_logger):
+        logger, lines = make_logger(header_length=10)
+        logger.log("HP:0000001HP:0000002HP:00", cmdline=False)
+        assert self._messages(lines()) == ["HP:0000001", "HP:0000002", "HP:00"]
+
+    def test_message_of_exactly_the_width_is_not_split(self, make_logger):
+        logger, lines = make_logger(header_length=10)
+        logger.log("abcde fghi", cmdline=False)
+        assert self._messages(lines()) == ["abcde fghi"]
+
+    def test_splits_at_a_tab(self, make_logger):
+        logger, lines = make_logger(header_length=10)
+        logger.log("abcde\tfghijkl", cmdline=False)
+        assert self._messages(lines()) == ["abcde", "fghijkl"]
+
+    def test_traceback_lines_stay_unchanged(self, make_logger):
+        logger, lines = make_logger(header_length=20)
+        try:
+            raise ValueError("a long error message that is not split")
+        except ValueError:
+            logger.exception("Mapping the terms failed badly", cmdline=False)
+        content = lines()
+        assert self._messages(content[:2]) == ["Mapping the terms", "failed badly"]
+        assert content[2] == "Traceback (most recent call last):\n"
+        assert content[-1] == "ValueError: a long error message that is not split\n"
+
+    def test_console_gets_the_same_lines(self, make_logger, capsys):
+        logger, lines = make_logger(header_length=10)
+        logger.log("first second")
+        out = capsys.readouterr().out.splitlines()
+        assert [line + "\n" for line in out] == lines()
+
+    def test_header_lines_are_not_split(self, make_logger):
+        logger, lines = make_logger(header_length=12)
+        logger.printHeader("Start", cmdline=False)
+        assert len(lines()) == 3
+
+    @pytest.mark.parametrize(
+        "text, width, parts",
+        [
+            ("", 5, [""]),
+            ("abc", 5, ["abc"]),
+            (" abcdefgh", 4, [" abc", "defg", "h"]),
+            ("ab  cdef", 4, ["ab ", "cdef"]),
+        ],
+    )
+    def test_split_line(self, text, width, parts):
+        assert Logger._splitLine(text, width) == parts
+
+
 # --------------------------------------------------------------------------
 # Thread safety
 # --------------------------------------------------------------------------
@@ -1256,7 +1453,7 @@ class TestThreadSafety:
         assert all(instance is instances[0] for instance in instances)
 
     def test_concurrent_logging_keeps_lines_intact(self, make_logger):
-        logger, lines = make_logger(header_length=10)
+        logger, lines = make_logger(header_length=20)
         def work(n):
             for i in range(100):
                 logger.log(f"thread {n} line {i}", cmdline=False)
@@ -1272,8 +1469,8 @@ class TestThreadSafety:
         # Every header body line is directly surrounded by its two borders.
         for i, line in enumerate(content):
             if line.rstrip("\n").endswith("=") and "T" in line:
-                assert content[i - 1].rstrip("\n").endswith("=" * 10)
-                assert content[i + 1].rstrip("\n").endswith("=" * 10)
+                assert content[i - 1].rstrip("\n").endswith("=" * 20)
+                assert content[i + 1].rstrip("\n").endswith("=" * 20)
 
 
 # --------------------------------------------------------------------------
@@ -1381,7 +1578,7 @@ class TestConsoleSetting:
     """Tests for console: false, which keeps all output in the log file."""
 
     def test_console_false_prints_nothing(self, make_logger, capsys):
-        logger, lines = make_logger(console=False, header_length=10)
+        logger, lines = make_logger(console=False, header_length=30)
         logger.log("a")
         logger.warning("b")
         logger.printHeader("c")
@@ -1496,7 +1693,8 @@ class TestReconfiguration:
 
     def test_change_is_logged_with_changed_settings(self, make_logger, capsys):
         logger, lines = make_logger(level="info")
-        Logger(config={"folder": logger.config.folder, "level": "info", "log_runtime": True})
+        Logger(config={"folder": logger.config.folder, "level": "info", "log_runtime": True,
+                       "header_length": 200})
         assert len(lines()) == 1
         assert lines()[0].endswith(
             "Logger configuration changed (log_runtime: False -> True).\n"
@@ -1504,9 +1702,10 @@ class TestReconfiguration:
         assert capsys.readouterr().out.count("configuration changed") == 1
 
     def test_change_of_file_is_logged_in_both_files(self, make_logger, tmp_path, capsys):
-        logger, old_lines = make_logger()
+        # Wider than the two temporary paths, so the note stays on one line.
+        logger, old_lines = make_logger(header_length=1000)
         new_folder = tmp_path / "new"
-        Logger(config={"folder": str(new_folder)})
+        Logger(config={"folder": str(new_folder), "header_length": 1000})
         new_path = os.path.join(str(new_folder), "output.log")
         assert old_lines()[0].endswith(f"Further messages go to '{new_path}'.\n")
         assert "folder: " in old_lines()[0]
@@ -1635,6 +1834,79 @@ class TestStandardLogging:
         with pytest.raises(ValueError):
             logger.captureStandardLogging(level="debug")
 
+    def test_python_warnings_are_captured(self, make_logger):
+        logger, lines = make_logger()
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            logger.captureStandardLogging(cmdline=False)
+            warnings.warn("n_jobs value 1 overridden", UserWarning)
+        assert len(lines()) == 1
+        assert re.search(
+            r"\[WARNING\] UserWarning: n_jobs value 1 overridden \(LoggerTest\.py:\d+\)\n$",
+            lines()[0],
+        )
+
+    def test_python_warnings_can_be_left_out(self, make_logger):
+        logger, lines = make_logger()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            logger.captureStandardLogging(cmdline=False, warnings=False)
+            assert Logger._showwarning is None
+            warnings.warn("not captured")
+        assert lines() == []
+
+    def test_python_warnings_are_not_captured_at_error_level(self, make_logger):
+        logger, lines = make_logger()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            logger.captureStandardLogging(level="error", cmdline=False)
+            assert Logger._showwarning is None
+            warnings.warn("not captured")
+        assert lines() == []
+
+    def test_python_warnings_console_output(self, make_logger, capsys):
+        logger, _ = make_logger()
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            logger.captureStandardLogging()
+            warnings.warn("visible", DeprecationWarning)
+        err = capsys.readouterr().err
+        # Once, by the Logger, not also by Python's own display.
+        assert err.count("visible") == 1
+        assert "DeprecationWarning: visible" in err
+
+    def test_release_restores_the_warning_display(self, make_logger):
+        logger, _ = make_logger()
+        with warnings.catch_warnings():
+            previous = warnings.showwarning
+            logger.captureStandardLogging(cmdline=False)
+            assert warnings.showwarning is not previous
+            Logger.releaseStandardLogging()
+            assert warnings.showwarning is previous
+            logger.captureStandardLogging(cmdline=False)
+            Logger.reset()
+            assert warnings.showwarning is previous
+
+    def test_release_keeps_a_display_replaced_since(self, make_logger):
+        logger, _ = make_logger()
+        with warnings.catch_warnings():
+            logger.captureStandardLogging(cmdline=False)
+            other = lambda *args, **kwargs: None
+            warnings.showwarning = other
+            Logger.releaseStandardLogging()
+            assert warnings.showwarning is other
+
+    def test_warning_without_configuration_is_shown_by_python(self, make_logger):
+        logger, _ = make_logger()
+        # pytest.warns() records what Python's own display receives.
+        with pytest.warns(UserWarning, match="fallback"):
+            logger.captureStandardLogging(cmdline=False)
+            Logger.config = None
+            try:
+                warnings.warn("fallback", UserWarning)
+            finally:
+                Logger.reset()
+
     def test_failure_is_reported_not_raised(self, make_logger, capsys):
         """A handler problem goes to stderr instead of breaking the caller."""
         logger, _ = make_logger()
@@ -1645,6 +1917,144 @@ class TestStandardLogging:
         finally:
             Logger.reset()
         assert "Logging error" in capsys.readouterr().err
+
+
+class TestUncaughtExceptions:
+    """
+    Tests for captureUncaughtExceptions(): exceptions that end the program
+    or a thread are written to the log file before Python reports them.
+    """
+
+    @pytest.fixture
+    def hooks(self, monkeypatch):
+        """
+        Replace sys.excepthook and threading.excepthook with recorders, so
+        the captured hooks pass on to them instead of printing.
+        """
+        calls = {"sys": [], "thread": []}
+        monkeypatch.setattr(sys, "excepthook", lambda *args: calls["sys"].append(args))
+        monkeypatch.setattr(threading, "excepthook", lambda args: calls["thread"].append(args))
+        return calls
+
+    @staticmethod
+    def _raise(exc):
+        """Raise and catch `exc`, so it has a traceback."""
+        try:
+            raise exc
+        except BaseException as e:
+            return e
+
+    def test_uncaught_exception_is_logged_and_passed_on(self, make_logger, hooks):
+        logger, lines = make_logger()
+        logger.captureUncaughtExceptions()
+        error = self._raise(ValueError("bad row"))
+        sys.excepthook(ValueError, error, error.__traceback__)
+        content = "".join(lines())
+        assert re.search(
+            r"\[ERROR  \] Run failed after \d\d:\d\d:\d\d\.\d\d with an uncaught exception\.\n",
+            content,
+        )
+        assert "Traceback (most recent call last):" in content
+        assert content.rstrip().endswith("ValueError: bad row")
+        assert hooks["sys"] == [(ValueError, error, error.__traceback__)]
+
+    def test_keyboard_interrupt_is_a_warning_without_traceback(self, make_logger, hooks):
+        logger, lines = make_logger()
+        logger.captureUncaughtExceptions()
+        error = self._raise(KeyboardInterrupt())
+        sys.excepthook(KeyboardInterrupt, error, error.__traceback__)
+        assert len(lines()) == 1
+        assert re.search(
+            r"\[WARNING\] Run interrupted after \d\d:\d\d:\d\d\.\d\d\.\n$", lines()[0]
+        )
+        assert len(hooks["sys"]) == 1
+
+    def test_thread_exception_is_logged(self, make_logger, hooks):
+        logger, lines = make_logger()
+        logger.captureUncaughtExceptions()
+        def fail():
+            raise RuntimeError("worker broke")
+        thread = threading.Thread(target=fail, name="worker-1")
+        thread.start()
+        thread.join()
+        content = "".join(lines())
+        assert "[ERROR  ] Thread 'worker-1' failed with an uncaught exception." in content
+        assert "RuntimeError: worker broke" in content
+        assert len(hooks["thread"]) == 1
+
+    def test_thread_system_exit_is_ignored(self, make_logger, hooks):
+        logger, lines = make_logger()
+        logger.captureUncaughtExceptions()
+        thread = threading.Thread(target=sys.exit)
+        thread.start()
+        thread.join()
+        assert lines() == []
+
+    def test_console_output_is_off_by_default(self, make_logger, hooks, capsys):
+        logger, _ = make_logger()
+        logger.captureUncaughtExceptions()
+        error = self._raise(ValueError("quiet"))
+        sys.excepthook(ValueError, error, error.__traceback__)
+        assert "quiet" not in capsys.readouterr().err
+        logger.captureUncaughtExceptions(cmdline=True)
+        sys.excepthook(ValueError, error, error.__traceback__)
+        assert "quiet" in capsys.readouterr().err
+
+    def test_capturing_again_replaces_the_hooks(self, make_logger, hooks):
+        logger, lines = make_logger()
+        logger.captureUncaughtExceptions()
+        logger.captureUncaughtExceptions()
+        error = self._raise(ValueError("once"))
+        sys.excepthook(ValueError, error, error.__traceback__)
+        assert "".join(lines()).count("Run failed after") == 1
+        assert len(hooks["sys"]) == 1
+
+    def test_release_and_reset_restore_the_hooks(self, make_logger, hooks):
+        logger, _ = make_logger()
+        previous_sys, previous_thread = sys.excepthook, threading.excepthook
+        logger.captureUncaughtExceptions()
+        Logger.releaseUncaughtExceptions()
+        assert (sys.excepthook, threading.excepthook) == (previous_sys, previous_thread)
+        logger.captureUncaughtExceptions()
+        Logger.reset()
+        assert (sys.excepthook, threading.excepthook) == (previous_sys, previous_thread)
+
+    def test_release_keeps_hooks_replaced_since(self, make_logger, hooks, monkeypatch):
+        logger, _ = make_logger()
+        logger.captureUncaughtExceptions()
+        other = lambda *args: None
+        monkeypatch.setattr(sys, "excepthook", other)
+        Logger.releaseUncaughtExceptions()
+        assert sys.excepthook is other
+
+    def test_logging_problem_does_not_stop_python_handling(self, make_logger, hooks):
+        logger, _ = make_logger()
+        logger.captureUncaughtExceptions()
+        Logger.config = None
+        error = self._raise(ValueError("still reported"))
+        sys.excepthook(ValueError, error, error.__traceback__)
+        assert len(hooks["sys"]) == 1
+
+    def test_real_crash_is_logged(self, tmp_path):
+        """A script that crashes writes the traceback to its log file."""
+        import subprocess
+        script = tmp_path / "crash.py"
+        script.write_text(
+            "from logger import Logger\n"
+            f"logger = Logger(config={{'folder': {str(tmp_path)!r}}})\n"
+            "logger.captureUncaughtExceptions()\n"
+            "raise ValueError('crashed')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(script)], capture_output=True, text=True,
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        )
+        assert result.returncode == 1
+        # Python still prints the traceback, and the log file has it too.
+        assert "ValueError: crashed" in result.stderr
+        content = (tmp_path / "output.log").read_text()
+        assert "Run failed after" in content
+        assert "ValueError: crashed" in content
 
 
 # --------------------------------------------------------------------------
@@ -1771,7 +2181,7 @@ class TestLoggerConfig:
 
     def test_package_exports(self):
         assert sorted(logger_package.__all__) == [
-            "LevelColors", "Logger", "LoggerConfig",
+            "LevelColors", "Logger", "LoggerConfig", "Progress",
             "lockedFile", "makeParentFolder", "writeAtomically", "writeJSON",
         ]
         for name in logger_package.__all__:
@@ -1819,6 +2229,16 @@ class ClosedPipe:
         raise BrokenPipeError
 
 
+class LostTerminal:
+    """Console stream whose terminal is gone, e.g. after an SSH session ended."""
+
+    def write(self, text):
+        raise OSError(5, "Input/output error")
+
+    def flush(self):
+        raise OSError(5, "Input/output error")
+
+
 class TestConsoleProblems:
     """
     Tests that problems with the console never lose a line in the log file
@@ -1845,6 +2265,37 @@ class TestConsoleProblems:
         assert content[0].endswith("] First\n")
         assert "[WARNING] Console output to stdout is closed (broken pipe)" in content[1]
         assert content[2].endswith("] Second\n")
+
+    def test_lost_terminal_does_not_stop_the_caller(self, make_logger, monkeypatch):
+        monkeypatch.setattr("sys.stdout", LostTerminal())
+        logger, lines = make_logger()
+        logger.log("First")
+        logger.log("Second")
+        content = lines()
+        assert len(content) == 3
+        assert content[0].endswith("] First\n")
+        assert ("[WARNING] Console output to stdout is closed "
+                "(OSError: [Errno 5] Input/output error)") in content[1]
+        assert content[2].endswith("] Second\n")
+
+    def test_closed_console_file_does_not_stop_the_caller(self, make_logger, monkeypatch):
+        closed = io.StringIO()
+        closed.close()
+        monkeypatch.setattr("sys.stderr", closed)
+        logger, lines = make_logger()
+        logger.error("Lost on console")
+        content = lines()
+        assert content[0].endswith("] Lost on console\n")
+        assert ("Console output to stderr is closed "
+                "(ValueError: I/O operation on closed file)") in content[1]
+
+    def test_lost_terminal_found_by_flush_is_reported(self, make_logger, monkeypatch, capsys):
+        monkeypatch.setattr("sys.stdout", LostTerminal())
+        logger, lines = make_logger()
+        logger.error("Error after lost stdout")
+        assert "Console output to stdout is closed (OSError" in lines()[1]
+        # stderr still works.
+        assert "Error after lost stdout" in capsys.readouterr().err
 
     def test_reset_switches_console_on_again(self, make_logger, monkeypatch, capsys):
         monkeypatch.setattr("sys.stdout", ClosedPipe())

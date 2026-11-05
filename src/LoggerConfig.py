@@ -67,8 +67,8 @@ class LoggerConfig(BaseModel):
     # borders and body would differ in width.
     header_char: str    = Field(default="=", min_length=1, max_length=1)
 
-    # Width of all printHeader() lines; at least one header_char on each
-    # side of the body.
+    # Width of all printHeader() lines (at least one header_char on each side
+    # of the body), and of messages: longer ones are split over several lines.
     header_length: int  = Field(default=60, ge=2)
 
     # Whether each line shows the runtime since the singleton was created
@@ -96,6 +96,12 @@ class LoggerConfig(BaseModel):
     # Only used if the stream is a terminal and NO_COLOR is not set, so
     # redirected output never contains color codes.
     colors: LevelColors = Field(default_factory=LevelColors)
+
+    @field_validator("colors", mode="before")
+    @classmethod
+    def empty_colors_section(cls, value):
+        """An empty `colors:` section (None in YAML) means the defaults, like `logger:`."""
+        return {} if value is None else value
 
     @field_validator("encoding")
     @classmethod

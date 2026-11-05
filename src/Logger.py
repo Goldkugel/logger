@@ -22,6 +22,8 @@ import textwrap
 import threading
 import time
 import traceback
+# Not "warnings": captureStandardLogging() has a parameter of that name.
+import warnings as pywarnings
 
 # pandas is only needed for a type hint, so it stays out of the runtime
 # dependencies.
@@ -67,9 +69,10 @@ standard_levels: dict[str, int] = {
 }
 
 # Logged once per stream when the console stops accepting output, e.g.
-# because the output was piped into `head`.
+# because the output was piped into `head` ("broken pipe") or the terminal of
+# an SSH session is gone.
 console_closed_message: str = (
-    "Console output to {stream} is closed (broken pipe); further messages "
+    "Console output to {stream} is closed ({reason}); further messages "
     "for {stream} are only written to the log file."
 )
 
@@ -102,11 +105,18 @@ class Logger:
         Guards singleton creation, configuration, writing and the standard
         logging capture. Replaced by a fresh lock in forked children.
     _closed_streams : set of str
-        Console streams ("stdout", "stderr") that hit a broken pipe and are
-        skipped from then on.
+        Console streams ("stdout", "stderr") that stopped accepting output
+        and are skipped from then on.
     _standard_handler, _standard_targets
         The handler installed by captureStandardLogging() and the standard
         loggers it was added to (with their previous levels).
+    _showwarning
+        (installed, previous) warnings.showwarning functions while Python
+        warnings are captured, else None.
+    _excepthooks
+        (installed sys hook, installed threading hook, previous sys hook,
+        previous threading hook) while uncaught exceptions are captured,
+        else None.
     """
 
     # Always assigned on the class, never on the instance, so that all
@@ -118,13 +128,15 @@ class Logger:
 
     # Re-entrant, because printHeader() calls log() while holding it,
     # _logWith() logs the closed-stream warning while holding it, and
-    # reset() and captureStandardLogging() call releaseStandardLogging().
+    # reset() and the capture methods call the release methods.
     _lock     : threading.RLock     = threading.RLock()
 
     _closed_streams: set[str]       = set()
 
     _standard_handler: StandardLoggingHandler | None    = None
     _standard_targets: list[tuple[logging.Logger, int]] = []
+    _showwarning     : tuple[Any, Any] | None           = None
+    _excepthooks     : tuple[Any, Any, Any, Any] | None = None
 
     def __new__(cls, *args, **kwargs):
         """
@@ -260,7 +272,9 @@ class Logger:
     def reset(cls) -> None:
         """
         Discard the singleton, its configuration and its start time, and
-        stop capturing standard logging (see releaseStandardLogging()).
+        stop capturing standard logging, Python warnings and uncaught
+        exceptions (see releaseStandardLogging() and
+        releaseUncaughtExceptions()).
 
         The next Logger() call starts afresh. Mainly useful in tests and
         notebooks. Old references share the class-level state, so they work
@@ -268,6 +282,7 @@ class Logger:
         """
         with cls._lock:
             cls.releaseStandardLogging()
+            cls.releaseUncaughtExceptions()
             cls._instance       = None
             cls.config          = None
             cls.start_time      = 0.0
@@ -373,7 +388,16 @@ class Logger:
         """Console stream for `level`: "stderr" for warnings and errors, else "stdout"."""
         return "stderr" if levels[level] >= levels[stderr_level] else "stdout"
 
-    def _printToConsole(self, message: str, level: str, config: LoggerConfig) -> list[str]:
+    @staticmethod
+    def _closedReason(error: Exception) -> str:
+        """Describe why a console stream stopped accepting output."""
+        if isinstance(error, BrokenPipeError):
+            return "broken pipe"
+        return Logger._describeError(error, width=60).rstrip(".")
+
+    def _printToConsole(
+        self, message: str, level: str, config: LoggerConfig
+    ) -> list[tuple[str, str]]:
         """
         Print `message` to the console stream for `level`, without letting
         the console break logging.
@@ -381,14 +405,15 @@ class Logger:
         stdout is flushed before writing to stderr, so lines keep their
         order when both go to one file (`> out.txt 2>&1`, where stdout is
         buffered but stderr is not). Unencodable characters are replaced,
-        since the log file has the full text. A stream with a broken pipe is
-        skipped for the rest of the run.
+        since the log file has the full text. A stream that fails (a broken
+        pipe, a terminal that is gone, a closed file) is skipped for the
+        rest of the run.
 
         Returns
         -------
-        list of str
-            Streams that have just turned out to be closed, so the caller
-            can log a warning about each.
+        list of (str, str)
+            Streams that have just turned out to be closed, with the reason,
+            so the caller can log a warning about each.
         """
         name   = self._consoleStream(level)
         closed = []
@@ -397,24 +422,26 @@ class Logger:
             try:
                 if sys.stdout is not None:
                     sys.stdout.flush()
-            except BrokenPipeError:
+            # OSError includes BrokenPipeError; ValueError is a closed file.
+            except (OSError, ValueError) as e:
                 Logger._closed_streams.add("stdout")
-                closed.append("stdout")
+                closed.append(("stdout", self._closedReason(e)))
 
         stream = getattr(sys, name)
         if stream is None or name in Logger._closed_streams:
             return closed
 
-        message = self._colorize(message, level, config, stream)
         try:
+            # Inside the try: isatty() fails on a closed stream as well.
+            message = self._colorize(message, level, config, stream)
             try:
                 print(message, file=stream)
             except UnicodeEncodeError:
                 encoding = getattr(stream, "encoding", None) or "ascii"
                 print(message.encode(encoding, "replace").decode(encoding), file=stream)
-        except BrokenPipeError:
+        except (OSError, ValueError) as e:
             Logger._closed_streams.add(name)
-            closed.append(name)
+            closed.append((name, self._closedReason(e)))
 
         return closed
 
@@ -443,7 +470,9 @@ class Logger:
         Each line has the form
             [<timestamp>] [<LEVEL>] (<runtime>) <message>
         where the runtime part is only present if `log_runtime` is enabled.
-        Messages below the configured minimum `level` are dropped. The line
+        A message longer than `header_length` is split over several such
+        lines (see _splitLine()). Messages below the configured minimum
+        `level` are dropped. The line
         is written to the file first, then (if `cmdline` and the `console`
         setting allow it) printed in the color of its level: "info" to
         stdout, "warning" and "error" to stderr. Console problems never stop
@@ -479,11 +508,34 @@ class Logger:
 
         self._logWith(self._currentConfig(), string, cmdline, level)
 
+    @staticmethod
+    def _splitLine(text: str, width: int) -> list[str]:
+        """
+        Split `text` into parts of at most `width` characters: at the last
+        whitespace within the limit (which is dropped), or at `width` itself
+        if there is none.
+        """
+        parts = []
+        while len(text) > width:
+            # Index of the last space or tab that keeps the part within width.
+            cut = max(text.rfind(" ", 0, width + 1), text.rfind("\t", 0, width + 1))
+            if cut > 0:
+                parts.append(text[:cut])
+                text = text[cut + 1:]
+            else:
+                parts.append(text[:width])
+                text = text[width:]
+        parts.append(text)
+        return parts
+
     def _logWith(self, config: LoggerConfig, string: str, cmdline: bool, level: str) -> None:
         """
-        Write one log line using `config`; the implementation of log().
+        Write one log entry using `config`; the implementation of log().
 
-        Separate from log() so that a line can be written with a
+        The first line of `string` is split at `header_length` (see
+        _splitLine()), and each part gets its own timestamp and level.
+        Further lines (e.g. a traceback) follow unchanged and without a
+        prefix. Separate from log() so that an entry can be written with a
         configuration other than the current one (see _logConfigChange()).
         """
         if levels[level] < levels[config.level]:
@@ -491,15 +543,17 @@ class Logger:
 
         path = self._logFilePath(config)
 
-        message = (
+        prefix = (
             f"[{dt.now().strftime(config.format)}] "
             f"[{level.upper():<{level_width}}] "
         )
 
         if config.log_runtime:
-            message = f"{message}({self._formatRuntime(config)}) "
+            prefix = f"{prefix}({self._formatRuntime(config)}) "
 
-        message = f"{message}{string}"
+        first, newline, rest = str(string).partition("\n")
+        message = "\n".join(prefix + part for part in self._splitLine(first, config.header_length))
+        message = f"{message}{newline}{rest}"
 
         with Logger._lock:
             # File first, so that a console problem can never lose the line.
@@ -508,9 +562,10 @@ class Logger:
             # Report a console stream that has just closed in the log file
             # (the lock is re-entrant).
             if cmdline and config.console:
-                for stream in self._printToConsole(message, level, config):
+                for stream, reason in self._printToConsole(message, level, config):
                     self._logWith(
-                        config, console_closed_message.format(stream=stream), False, "warning"
+                        config, console_closed_message.format(stream=stream, reason=reason),
+                        False, "warning",
                     )
 
     def info(self, string: str = "", cmdline: bool = True) -> None:
@@ -621,11 +676,73 @@ class Logger:
         duration = self._formatDuration(time.monotonic() - start, precise=True)
         self.log(f"{name} took {duration}.", cmdline)
 
+    @contextmanager
+    def progress(
+        self,
+        name: str,
+        total: int | None = None,
+        every: int | None = None,
+        seconds: float | None = 60.0,
+        cmdline: bool = True,
+    ) -> Iterator[Progress]:
+        """
+        Context manager like step() that also logs the progress of a loop.
+
+        Usage:
+            with logger.progress("Encoding terms", total=len(terms)) as p:
+                for chunk in chunks:
+                    ...
+                    p.update(len(chunk))
+
+        Logs "Encoding terms..." on entry, then from update() lines such as
+        "Encoding terms: 2000/10000 (20.0%), elapsed 00:01:02, remaining
+        ~00:04:08." (the remaining time from the average speed so far), and
+        "Encoding terms took 00:05:10.20." on exit. A line is logged once
+        `every` more items are done or `seconds` have passed since the last
+        one, and when `total` is reached; progress not logged yet is logged
+        on exit, also if the block fails (then as in step()).
+
+        Parameters
+        ----------
+        name : str
+            Name of the task, shown in the log messages.
+        total : int or None, optional
+            Number of items to process; None if unknown, which logs
+            "<name>: 2000 done, elapsed 00:01:02." without a percentage.
+        every : int or None, optional
+            Log a line every `every` items (None: no item interval).
+        seconds : float or None, optional
+            Log a line at most this many seconds after the last one (default
+            60; None: no time interval). update() checks it, so a line can
+            only appear when update() is called.
+        cmdline : bool, optional
+            Whether to also print the messages to the console (default True).
+
+        Raises
+        ------
+        ValueError
+            If `total` is negative, or `every` or `seconds` is not positive.
+        """
+        if total is not None and total < 0:
+            raise ValueError(f"total must not be negative, got {total}")
+        if every is not None and every <= 0:
+            raise ValueError(f"every must be positive, got {every}")
+        if seconds is not None and seconds <= 0:
+            raise ValueError(f"seconds must be positive, got {seconds}")
+
+        with self.step(name, cmdline):
+            tracker = Progress(self, name, total, every, seconds, cmdline)
+            try:
+                yield tracker
+            finally:
+                tracker._finish()
+
     def captureStandardLogging(
         self,
         level: str = "warning",
         loggers: Iterable[str] | str = ("",),
         cmdline: bool = True,
+        warnings: bool = True,
     ) -> logging.Handler:
         """
         Write messages of Python's standard logging module to this log.
@@ -635,6 +752,11 @@ class Logger:
         reach the log file. Records of at least `level` are logged as
         "<logger name>: <message>" with the matching level and traceback,
         subject to the Logger's own minimum level and `console` setting.
+
+        Python warnings (warnings.warn(), used e.g. by numpy, pandas or
+        UMAP) are captured too, as warnings "UserWarning: <message>
+        (<file>:<line>)". Python shows a warning only once per code
+        location by default, so a loop does not repeat it.
 
         Calling it again replaces the previous capture. Undo it with
         releaseStandardLogging(); Logger.reset() does so as well.
@@ -655,6 +777,9 @@ class Logger:
             (default True). Without other handlers, the standard logging
             module stops printing warnings to stderr once this capture is
             installed, so they are not shown twice.
+        warnings : bool, optional
+            Whether Python warnings are captured as well (default True). Not
+            with level="error", since they are warnings.
 
         Returns
         -------
@@ -690,14 +815,34 @@ class Logger:
 
             Logger._standard_handler = handler
 
+            if warnings and standard_levels[level] <= logging.WARNING:
+                previous = pywarnings.showwarning
+
+                def showwarning(message, category, filename, lineno, file=None, line=None):
+                    # Same signature as warnings.showwarning().
+                    try:
+                        self.log(
+                            f"{category.__name__}: {message} "
+                            f"({os.path.basename(filename)}:{lineno})",
+                            cmdline, level="warning",
+                        )
+                    except Exception:
+                        # e.g. no configuration after reset(): show it as
+                        # Python would have.
+                        previous(message, category, filename, lineno, file, line)
+
+                pywarnings.showwarning = showwarning
+                Logger._showwarning    = (showwarning, previous)
+
         return handler
 
     @classmethod
     def releaseStandardLogging(cls) -> None:
         """
         Stop capturing standard logging (see captureStandardLogging()):
-        remove the handler and restore the previous logger levels. Does
-        nothing if nothing is captured.
+        remove the handler, restore the previous logger levels and the
+        previous display of Python warnings. Does nothing if nothing is
+        captured.
         """
         with cls._lock:
             for target, previous_level in cls._standard_targets:
@@ -706,6 +851,91 @@ class Logger:
 
             cls._standard_handler = None
             cls._standard_targets = []
+
+            if cls._showwarning is not None:
+                installed, previous = cls._showwarning
+                # Unless another library has replaced it since.
+                if pywarnings.showwarning is installed:
+                    pywarnings.showwarning = previous
+                cls._showwarning = None
+
+    def captureUncaughtExceptions(self, cmdline: bool = False) -> None:
+        """
+        Write exceptions that end the program (or a thread) to this log.
+
+        Without it, the traceback of an exception that nothing catches only
+        goes to stderr, so the log file of a crashed batch job does not say
+        why it ended. The exception is logged as an error, "Run failed
+        after <runtime> with an uncaught exception." or "Thread '<name>'
+        failed with an uncaught exception.", followed by the traceback as
+        in exception(). A KeyboardInterrupt only gives the warning "Run
+        interrupted after <runtime>.". Python's own handling (the traceback
+        on stderr) still follows.
+
+        Calling it again replaces the previous capture. Undo it with
+        releaseUncaughtExceptions(); Logger.reset() does so as well. A job
+        killed by a signal (e.g. by Slurm at its time limit) raises no
+        exception, so it is not logged.
+
+        Parameters
+        ----------
+        cmdline : bool, optional
+            Whether the lines are also printed to the console (default
+            False, since Python prints the traceback to stderr anyway).
+        """
+        with Logger._lock:
+            Logger.releaseUncaughtExceptions()
+            previous_sys, previous_thread = sys.excepthook, threading.excepthook
+
+            def sys_hook(exc_type, exc, tb):
+                self._logUncaught(exc, None, cmdline)
+                previous_sys(exc_type, exc, tb)
+
+            def thread_hook(args):
+                # The default hook ignores SystemExit; so does this one.
+                if not issubclass(args.exc_type, SystemExit):
+                    name = args.thread.name if args.thread is not None else "unknown"
+                    self._logUncaught(args.exc_value, name, cmdline)
+                previous_thread(args)
+
+            sys.excepthook, threading.excepthook = sys_hook, thread_hook
+            Logger._excepthooks = (sys_hook, thread_hook, previous_sys, previous_thread)
+
+    def _logUncaught(self, exc: BaseException | None, thread: str | None, cmdline: bool) -> None:
+        """
+        Log an uncaught exception for captureUncaughtExceptions(); `thread`
+        is the name of the failed thread, or None for the main program. Never
+        raises, so Python's own handling always follows.
+        """
+        try:
+            if thread is not None:
+                self.exception(f"Thread '{thread}' failed with an uncaught exception.", exc, cmdline)
+                return
+            runtime = self._formatDuration(time.monotonic() - Logger.start_time, precise=True)
+            if isinstance(exc, KeyboardInterrupt):
+                self.log(f"Run interrupted after {runtime}.", cmdline, level="warning")
+            else:
+                self.exception(f"Run failed after {runtime} with an uncaught exception.", exc, cmdline)
+        except Exception:
+            # e.g. no configuration after reset(); Python still reports it.
+            pass
+
+    @classmethod
+    def releaseUncaughtExceptions(cls) -> None:
+        """
+        Stop capturing uncaught exceptions (see captureUncaughtExceptions())
+        and restore the previous hooks, unless another library has replaced
+        them since. Does nothing if nothing is captured.
+        """
+        with cls._lock:
+            if cls._excepthooks is None:
+                return
+            sys_hook, thread_hook, previous_sys, previous_thread = cls._excepthooks
+            if sys.excepthook is sys_hook:
+                sys.excepthook = previous_sys
+            if threading.excepthook is thread_hook:
+                threading.excepthook = previous_thread
+            cls._excepthooks = None
 
     def printHeader(self, text: str = "", cmdline: bool = True, level: str = "info") -> int:
         """
@@ -879,6 +1109,79 @@ class Logger:
         Parameters and return value as in printFileProcessingStart().
         """
         return self._logFileEvent("Writing", file, completed=True, cmdline=cmdline, level=level)
+
+
+class Progress:
+    """
+    Progress of a task, returned by Logger.progress(). Call update() after
+    each item or batch; it logs a progress line when one is due.
+    Thread-safe, so worker threads can report to the same instance.
+    """
+
+    def __init__(
+        self,
+        logger: Logger,
+        name: str,
+        total: int | None,
+        every: int | None,
+        seconds: float | None,
+        cmdline: bool,
+    ):
+        """Track `name` for Logger.progress(); see there for the parameters."""
+        self._logger   = logger
+        self._name     = name
+        self._every    = every
+        self._seconds  = seconds
+        self._cmdline  = cmdline
+        self._lock     = threading.Lock()
+        self.total     = total
+        # Items done so far, and when and at which count the last line was
+        # logged.
+        self.done      = 0
+        self._start    = time.monotonic()
+        self._last_time = self._start
+        self._last_done = 0
+
+    def update(self, n: int = 1) -> None:
+        """Mark `n` more items as done and log a progress line if one is due."""
+        with self._lock:
+            previous   = self.done
+            self.done += n
+            now        = time.monotonic()
+            due = (
+                (self._every is not None and self.done // self._every > previous // self._every)
+                or (self._seconds is not None and now - self._last_time >= self._seconds)
+                or (self.total is not None and previous < self.total <= self.done)
+            )
+            if due:
+                self._report(now)
+
+    def _finish(self) -> None:
+        """Log the progress not logged yet, if any; called on exit."""
+        with self._lock:
+            if self.done != self._last_done:
+                self._report(time.monotonic())
+
+    def _report(self, now: float) -> None:
+        """
+        Log "<name>: <done>/<total> (<percent>%), elapsed <time>, remaining
+        ~<time>.", without the remaining time once `total` is reached and
+        without total and percentage if `total` is None.
+        """
+        elapsed = now - self._start
+        text    = f"{self._name}: "
+        if self.total is None:
+            text += f"{self.done} done, elapsed {Logger._formatDuration(elapsed)}"
+        else:
+            percent = 100.0 if self.total == 0 else 100 * self.done / self.total
+            text   += f"{self.done}/{self.total} ({percent:.1f}%), elapsed {Logger._formatDuration(elapsed)}"
+            if 0 < self.done < self.total:
+                # From the average time per item so far.
+                remaining = elapsed / self.done * (self.total - self.done)
+                text += f", remaining ~{Logger._formatDuration(remaining)}"
+        self._logger.log(f"{text}.", self._cmdline)
+        self._last_time = now
+        self._last_done = self.done
 
 
 class StandardLoggingHandler(logging.Handler):
