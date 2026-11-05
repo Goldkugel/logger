@@ -40,6 +40,7 @@ levels: dict[str, int]     = {"info": 0, "warning": 1, "error": 2}
 # Width of the level tag ("[INFO   ]"), so all messages start in one column.
 level_width: int           = max(len(level) for level in levels)
 
+# ANSI escape codes per ColorName of LoggerConfig; "none" adds no code.
 ansi_colors: dict[str, str] = {
     "none"   : "",
     "black"  : "\033[30m",
@@ -144,12 +145,10 @@ class Logger:
 
         __init__ runs on every Logger(...) call. A bare Logger() keeps the
         current configuration, so modules can fetch the singleton without
-        knowing which config the entry point used; only the first call
-        falls back to ./config/config.yaml. An explicit config replaces the
-        current one, unless replace=False, which library code uses to
-        provide a fallback without overriding the entry point's config.
-        A replaced configuration is reported in the log (see
-        _logConfigChange()).
+        knowing which config the entry point used. An explicit config
+        replaces the current one (and the change is logged), unless
+        replace=False, which lets library code provide a fallback without
+        overriding the entry point's config.
 
         Parameters
         ----------
@@ -426,7 +425,7 @@ class Logger:
 
         The folder is only created when opening shows it is missing (first
         line, or deleted during the run): checking it before every line made
-        log() about a third slower (12 instead of 8 µs per line).
+        log() about a third slower.
         """
         try:
             log_file = open(path, mode="a", encoding=encoding)
@@ -537,6 +536,8 @@ class Logger:
         """
         text = " ".join(line.strip() for line in str(error).splitlines() if line.strip())
         name = type(error).__name__
+        # 2 for ": " and 6 for " (...)". A final "." is dropped, since
+        # step() adds its own.
         if width is not None and text and len(name) + 2 + len(text) > width:
             text = textwrap.shorten(text.rstrip("."), width=max(width - len(name) - 2 - 6, 10),
                                     placeholder="")
@@ -887,6 +888,7 @@ class StandardLoggingHandler(logging.Handler):
     """
 
     def __init__(self, logger: Logger, cmdline: bool = True):
+        """Write records to `logger`, also to the console if `cmdline`."""
         super().__init__()
         self._logger  = logger
         self._cmdline = cmdline
@@ -911,6 +913,8 @@ class StandardLoggingHandler(logging.Handler):
                 level = "info"
 
             self._logger.log(f"{record.name}: {message}", self._cmdline, level=level)
+        # Re-raised as in logging.StreamHandler.emit(): a RecursionError is
+        # not a handler failure to report.
         except RecursionError:
             raise
         except Exception:

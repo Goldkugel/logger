@@ -35,9 +35,8 @@ def makeParentFolder(path: str) -> None:
 def writeAtomically(path: str, write: Callable[[str], None]) -> None:
     """
     Calls write(tmp_path) to write the file to "<path>.tmp", which then
-    replaces `path` in a single operation. An interrupted write (e.g. a Slurm
-    job being killed) therefore never leaves a partially written file. The
-    folder of `path` is created if needed.
+    replaces `path` in a single operation, so a killed job never leaves a
+    partially written file. The folder of `path` is created if needed.
 
     :param path: Destination file path.
     :param write: Function writing the complete file to the path it is given.
@@ -89,6 +88,8 @@ def lockedFile(path: str) -> Iterator[None]:
     """
     makeParentFolder(path)
 
+    # The lock file is never deleted: a process still waiting on it would
+    # then hold a lock on a different file than the next process.
     lock_path = path + ".lock"
     with open(lock_path, mode="a", encoding="utf-8") as handle:
         locked = False

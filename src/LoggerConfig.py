@@ -85,6 +85,7 @@ class LoggerConfig(BaseModel):
     # everything, "warning" only warnings and errors, "error" only errors.
     level: LogLevel     = "info"
 
+    # Display of the runtime if `log_runtime` is set (see RuntimeFormat).
     runtime_format: RuntimeFormat = "minutes"
 
     # Whether lines are also printed to the console (info to stdout,

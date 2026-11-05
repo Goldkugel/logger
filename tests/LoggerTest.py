@@ -135,10 +135,8 @@ class TestSingleton:
 
     def test_config_shared_across_instances(self, config_file, tmp_path):
         """
-        Because `config` is a class attribute, calling Logger() a second
-        time with a different config path overwrites the shared config.
-        This test documents that behaviour explicitly so it is not
-        accidentally "fixed" in a way that breaks callers relying on it.
+        `config` is a class attribute, so a second Logger() call with
+        another config replaces it for all references (intended).
         """
         config_path, _ = config_file
         logger1 = Logger(config=config_path)
@@ -167,9 +165,8 @@ class TestSingleton:
 
     def test_bare_call_keeps_loaded_config(self, config_file, tmp_path):
         """
-        Logger() without a path after the first call must keep the
-        configuration loaded earlier instead of re-reading the default
-        ./config/config.yaml.
+        Logger() without a path keeps the loaded configuration instead of
+        re-reading ./config/config.yaml.
         """
         config_path, _ = config_file
         other_config_path = tmp_path / "other_config.yaml"
@@ -352,10 +349,7 @@ class TestLog:
         assert "Minutes" in lines[0]
 
     def test_log_excludes_runtime_when_disabled(self, config_file, tmp_path):
-        """
-        Build a disposable config with log_runtime=False and verify that
-        the "Minutes" token is absent from the log line.
-        """
+        """With log_runtime=False the line has no "(... Minutes)" part."""
         _, log_folder = config_file
         disabled_config_path = tmp_path / "disabled_config.yaml"
         folder_value = log_folder if log_folder.endswith(os.sep) else log_folder + os.sep
@@ -384,10 +378,7 @@ class TestLog:
         assert lines == []
 
     def test_log_empty_string_still_writes_timestamp(self, logger_instance):
-        """
-        An empty string produces a timestamp-only line, useful for adding
-        blank separators to the log without a visible message body.
-        """
+        """An empty string gives a line without a message (a separator)."""
         logger, log_folder = logger_instance
         logger.log("", cmdline=False)
         lines = read_log_lines(log_folder)
@@ -510,10 +501,11 @@ class TestLog:
     def test_built_in_messages_share_one_structure(self, make_logger):
         """
         Every message the logger writes itself is one line of the form
-        [<timestamp>] [<LEVEL>] (<runtime>) <sentence ending in ".">, or
-        <task>... when a task starts, followed by "<task> completed", "<task>
-        took <duration>" (a step) or "<task> failed" when it ends.
-        (Header lines and exception() tracebacks are tested separately.)
+        [<timestamp>] [<LEVEL>] (<runtime>) <sentence ending in ".">. A
+        "<task>..." line is followed by "<task> completed." (file events),
+        "<task> took <duration>." or "<task> failed after <duration>." (with
+        a "Reason: ..." line, for step()). Header lines and exception()
+        tracebacks are tested separately.
         """
         logger, lines = make_logger(log_runtime=True)
         logger.printFileProcessingStart("/a/in.csv", cmdline=False)
@@ -579,10 +571,7 @@ class TestPrintHeader:
         assert "Title" in lines[1]
 
     def test_returns_expected_length(self, logger_instance):
-        """
-        The return value should equal the combined character length of all
-        three logged lines (excluding timestamps and newlines).
-        """
+        """Returns the length of the three lines without timestamps and newlines."""
         logger, _ = logger_instance
         header_length = logger.config.header_length
         header_char   = logger.config.header_char
@@ -913,7 +902,7 @@ def make_logger(tmp_path):
     """
     Factory building a Logger that writes to a temporary folder, with the
     given config overrides. Returns the logger and a function reading the
-    lines of its log file.
+    lines of its log file. Used throughout this file.
     """
     def factory(**overrides):
         config = {"folder": str(tmp_path), **overrides}
@@ -1292,7 +1281,7 @@ class TestThreadSafety:
 # --------------------------------------------------------------------------
 
 class RecordingStream(io.StringIO):
-    """stdout replacement that records when it is flushed."""
+    """Console stream replacement that records its writes and flushes."""
 
     def __init__(self, events, name):
         super().__init__()
@@ -1821,7 +1810,7 @@ class TestLoggerConfig:
 # --------------------------------------------------------------------------
 
 class ClosedPipe:
-    """stdout replacement behaving like a pipe whose reader has exited."""
+    """Console stream replacement behaving like a pipe whose reader has exited."""
 
     def write(self, text):
         raise BrokenPipeError
